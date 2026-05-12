@@ -48,6 +48,145 @@ async function summarizeHistory(messages, systemPrompt) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// GOOGLE CALENDAR — CONSULTA DE DISPONIBILIDAD
+// ─────────────────────────────────────────────────────────────
+
+// Detecta si el mensaje del huésped es una pregunta de disponibilidad
+function isAvailabilityQuestion(message) {
+  const lower = message.toLowerCase();
+  const keywords = [
+    "disponible", "disponibilidad", "available", "availability",
+    "libre", "free", "vacant", "vacancy",
+    "reservar", "reserve", "book", "booking",
+    "fechas", "dates", "when", "cuándo", "cuando",
+    "hay lugar", "hay cupo", "hay habitación", "hay habitacion",
+    "puedo ir", "podemos ir", "can we come", "can i come",
+    "check in", "check-in", "checkin",
+    "check out", "check-out", "checkout"
+  ];
+  return keywords.some(k => lower.includes(k));
+}
+
+// Genera un JWT firmado para autenticarse con Google APIs
+async function getGoogleAccessToken() {
+  const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!serviceAccountJson) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON not set");
+
+  const serviceAccount = JSON.parse(serviceAccountJson);
+
+  const header = { alg: "RS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const claim = {
+    iss: serviceAccount.client_email,
+    scope: "https://www.googleapis.com/auth/calendar.readonly",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now
+  };
+
+  // Encode header and claim
+  const encode = obj => Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const headerB64 = encode(header);
+  const claimB64 = encode(claim);
+  const signingInput = `${headerB64}.${claimB64}`;
+
+  // Sign with private key using Web Crypto API
+  const privateKeyPem = serviceAccount.private_key;
+  const pemBody = privateKeyPem
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\s/g, "");
+  const keyBuffer = Buffer.from(pemBody, "base64");
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    keyBuffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    cryptoKey,
+    Buffer.from(signingInput)
+  );
+
+  const signatureB64 = Buffer.from(signature).toString("base64url");
+  const jwt = `${signingInput}.${signatureB64}`;
+
+  // Exchange JWT for access token
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt
+    })
+  });
+
+  const tokenData = await tokenResponse.json();
+  if (!tokenData.access_token) {
+    throw new Error(`Failed to get access token: ${JSON.stringify(tokenData)}`);
+  }
+
+  return tokenData.access_token;
+}
+
+// Consulta Google Calendar y retorna fechas ocupadas en los próximos 90 días
+async function getOccupiedDates(calendarId) {
+  try {
+    const accessToken = await getGoogleAccessToken();
+
+    const now = new Date();
+    const future = new Date();
+    future.setDate(future.getDate() + 90);
+
+    const params = new URLSearchParams({
+      timeMin: now.toISOString(),
+      timeMax: future.toISOString(),
+      singleEvents: "true",
+      orderBy: "startTime"
+    });
+
+    const response = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${params}`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      }
+    );
+
+    const data = await response.json();
+
+    if (!data.items || data.items.length === 0) {
+      return { occupied: [], summary: "No hay reservas registradas en los próximos 90 días." };
+    }
+
+    const occupied = data.items.map(event => {
+      const start = event.start?.date || event.start?.dateTime?.split("T")[0];
+      const end = event.end?.date || event.end?.dateTime?.split("T")[0];
+      return { start, end, title: event.summary || "Reservado" };
+    });
+
+    // Construir resumen legible
+    const lines = occupied.map(e => {
+      const startDate = new Date(e.start + "T12:00:00");
+      const endDate = new Date(e.end + "T12:00:00");
+      const startStr = startDate.toLocaleDateString("es-MX", { day: "numeric", month: "long" });
+      const endStr = endDate.toLocaleDateString("es-MX", { day: "numeric", month: "long" });
+      return `• ${startStr} al ${endStr}`;
+    });
+
+    const summary = `Fechas ocupadas en los próximos 90 días:\n${lines.join("\n")}`;
+    return { occupied, summary };
+
+  } catch (err) {
+    console.error("Calendar error:", err.message);
+    return { occupied: [], summary: null, error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // DETECCIÓN INTELIGENTE DE PROPIEDAD
 // ─────────────────────────────────────────────────────────────
 async function detectPropertyFromMessage(userMessage, propertiesList) {
@@ -243,7 +382,7 @@ exports.handler = async (event) => {
   }
 
   try {
-    let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw;
+    let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw, calendarId;
 
     const contentType = event.headers["content-type"] || "";
 
@@ -255,6 +394,7 @@ exports.handler = async (event) => {
       ownerWhatsapp     = params.get("ownerWhatsapp") || "";
       propertyId        = params.get("propertyId") || "";
       propertiesListRaw = params.get("propertiesList") || "[]";
+      calendarId        = params.get("calendarId") || "";
     } else {
       const body = JSON.parse(event.body);
       systemPrompt      = body.systemPrompt || "";
@@ -263,6 +403,7 @@ exports.handler = async (event) => {
       ownerWhatsapp     = body.ownerWhatsapp || "";
       propertyId        = body.propertyId || "";
       propertiesListRaw = body.propertiesList || "[]";
+      calendarId        = body.calendarId || "";
     }
 
     if (!userMessage) {
@@ -381,6 +522,21 @@ exports.handler = async (event) => {
       };
     }
 
+    // ─────────────────────────────────────────────
+    // CONSULTA DE DISPONIBILIDAD EN GOOGLE CALENDAR
+    // Solo si el mensaje pregunta sobre fechas y hay calendarId
+    // ─────────────────────────────────────────────
+    let availabilityContext = "";
+
+    if (calendarId && isAvailabilityQuestion(userMessage)) {
+      const { summary, error } = await getOccupiedDates(calendarId);
+      if (summary) {
+        availabilityContext = `\n\nREAL-TIME AVAILABILITY DATA (from Google Calendar):\n${summary}\nUse this data to answer any availability questions. If the guest's requested dates are not in the occupied list, they are available.`;
+      } else if (error) {
+        console.error("Calendar fetch error:", error);
+      }
+    }
+
     // Parsear historial
     let previousMessages = [];
     let conversationSummary = "";
@@ -428,8 +584,8 @@ If a field is empty or not mentioned in this prompt, treat it as unknown — do 
 This rule overrides everything else.`;
 
     const fullSystemPrompt = conversationSummary
-      ? `${systemPrompt}${dataIntegrityRule}\n\nConversation summary so far: ${conversationSummary}`
-      : `${systemPrompt}${dataIntegrityRule}`;
+      ? `${systemPrompt}${dataIntegrityRule}${availabilityContext}\n\nConversation summary so far: ${conversationSummary}`
+      : `${systemPrompt}${dataIntegrityRule}${availabilityContext}`;
 
     const messages = [
       ...previousMessages,
