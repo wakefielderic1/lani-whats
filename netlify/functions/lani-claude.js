@@ -253,6 +253,23 @@ const BOOKING_FIELDS_ORDER = [
   "guest_phone"
 ];
 
+// Labels presentables para tipos de habitación
+// internal_key → display label
+const ROOM_TYPE_LABELS = {
+  "garden_room": "Garden Room",
+  "ocean_view": "Ocean View",
+  "villa": "Villa"
+};
+
+function formatRoomLabel(internalKey) {
+  if (ROOM_TYPE_LABELS[internalKey]) return ROOM_TYPE_LABELS[internalKey];
+  // fallback: capitalizar y quitar underscores
+  return internalKey
+    .split("_")
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
 const FIELD_QUESTIONS_ES = {
   room_type: "¿Qué tipo de habitación te interesa?",
   check_in: "¿Cuál sería tu fecha de llegada (check-in)?",
@@ -364,9 +381,14 @@ DATE PARSING RULES:
 - If year is ambiguous, assume the nearest future occurrence
 
 ROOM TYPE MATCHING:
-- Match flexibly: "deluxe", "la deluxe", "habitación deluxe", "delux" → "deluxe"
-- "ocean view", "vista al mar", "con vista" → match closest in available rates
-- If guest asks for a type not in rates → set room_type to null and add note in extraction_notes
+- The available room types are INTERNAL KEYS like "garden_room", "ocean_view", "villa".
+- Map flexibly from guest phrasing to the correct internal key:
+  * "garden room", "garden", "jardín", "habitación jardín", "la garden", "el garden room" → "garden_room"
+  * "ocean view", "ocean", "vista al mar", "con vista", "la ocean", "el ocean view", "vista mar" → "ocean_view"
+  * "villa", "la villa", "private villa", "the villa" → "villa"
+- ALWAYS return the internal_key (with underscores), NEVER the display label.
+- If guest asks for a type not in the available rates → set room_type to null and add note in extraction_notes
+- IMPORTANT: only consider types that appear in the AVAILABLE ROOM TYPES AND RATES list above. If a type has no price listed, it's not available.
 
 CONFIDENCE:
 - Only include fields you are confident about
@@ -472,12 +494,18 @@ function buildBookingFlowResponse({
 
     // Si lo siguiente es room_type y hay rates configurados, agregar opciones
     if (nextQuestion === "room_type" && roomRates && Object.keys(roomRates).length > 0) {
-      const roomList = Object.entries(roomRates)
-        .map(([k, v]) => `- ${k.charAt(0).toUpperCase() + k.slice(1)}: $${v} USD/noche`)
-        .join("\n");
-      suggestedReply = language === "es"
-        ? `${suggestedReply}\n\nTenemos disponibles:\n${roomList}`
-        : `${suggestedReply}\n\nWe have available:\n${roomList}`;
+      // Filtrar solo tipos con precio válido (> 0)
+      const availableTypes = Object.entries(roomRates)
+        .filter(([k, v]) => v && Number(v) > 0);
+
+      if (availableTypes.length > 0) {
+        const roomList = availableTypes
+          .map(([k, v]) => `- ${formatRoomLabel(k)}: $${v} USD/noche`)
+          .join("\n");
+        suggestedReply = language === "es"
+          ? `${suggestedReply}\n\nTenemos disponibles:\n${roomList}`
+          : `${suggestedReply}\n\nWe have available:\n${roomList.replace(/\/noche/g, '/night')}`;
+      }
     }
   }
 
@@ -756,18 +784,22 @@ Keep the warm, friendly tone of the property.`;
     } else if (bookingFlow.intent && bookingFlow.stage === "READY_TO_HOLD") {
       const total = bookingFlow.total_amount;
       const nights = bookingFlow.nights;
+      const roomLabel = bookingFlow.data.room_type
+        ? formatRoomLabel(bookingFlow.data.room_type)
+        : "the room";
       bookingContext = `
 
 BOOKING FLOW ACTIVE — READY TO HOLD:
 The guest has provided all booking details. Total: $${total} USD for ${nights} nights.
+Room type (for display): ${roomLabel}
 
 CRITICAL: Your reply should:
-1. Briefly summarize the booking (name, dates, room type, guests, total)
+1. Briefly summarize the booking (name, dates, room type as "${roomLabel}", guests, total)
 2. Say you are checking availability right now (it will be confirmed in seconds by the system)
 3. Do NOT promise payment options yet — the system will handle that next
 4. Keep it warm and natural, 3-4 lines max.
 
-Example tone: "Perfecto Juan, déjame confirmar disponibilidad para la Deluxe del 15 al 18 de junio (3 noches, $450 USD para 2 personas). Un segundo..."`;
+Example tone: "Perfecto Juan, déjame confirmar disponibilidad para la ${roomLabel} del 15 al 18 de junio (${nights} noches, $${total} USD para 2 personas). Un segundo..."`;
     }
 
     const fullSystemPrompt = conversationSummary
