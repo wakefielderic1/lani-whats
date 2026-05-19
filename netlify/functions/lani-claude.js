@@ -48,145 +48,6 @@ async function summarizeHistory(messages, systemPrompt) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// GOOGLE CALENDAR — CONSULTA DE DISPONIBILIDAD
-// ─────────────────────────────────────────────────────────────
-
-// Detecta si el mensaje del huésped es una pregunta de disponibilidad
-function isAvailabilityQuestion(message) {
-  const lower = message.toLowerCase();
-  const keywords = [
-    "disponible", "disponibilidad", "available", "availability",
-    "libre", "free", "vacant", "vacancy",
-    "reservar", "reserve", "book", "booking",
-    "fechas", "dates", "when", "cuándo", "cuando",
-    "hay lugar", "hay cupo", "hay habitación", "hay habitacion",
-    "puedo ir", "podemos ir", "can we come", "can i come",
-    "check in", "check-in", "checkin",
-    "check out", "check-out", "checkout"
-  ];
-  return keywords.some(k => lower.includes(k));
-}
-
-// Genera un JWT firmado para autenticarse con Google APIs
-async function getGoogleAccessToken() {
-  const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!serviceAccountJson) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON not set");
-
-  const serviceAccount = JSON.parse(serviceAccountJson);
-
-  const header = { alg: "RS256", typ: "JWT" };
-  const now = Math.floor(Date.now() / 1000);
-  const claim = {
-    iss: serviceAccount.client_email,
-    scope: "https://www.googleapis.com/auth/calendar.readonly",
-    aud: "https://oauth2.googleapis.com/token",
-    exp: now + 3600,
-    iat: now
-  };
-
-  // Encode header and claim
-  const encode = obj => Buffer.from(JSON.stringify(obj)).toString("base64url");
-  const headerB64 = encode(header);
-  const claimB64 = encode(claim);
-  const signingInput = `${headerB64}.${claimB64}`;
-
-  // Sign with private key using Web Crypto API
-  const privateKeyPem = serviceAccount.private_key;
-  const pemBody = privateKeyPem
-    .replace("-----BEGIN PRIVATE KEY-----", "")
-    .replace("-----END PRIVATE KEY-----", "")
-    .replace(/\s/g, "");
-  const keyBuffer = Buffer.from(pemBody, "base64");
-
-  const cryptoKey = await crypto.subtle.importKey(
-    "pkcs8",
-    keyBuffer,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-
-  const signature = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    cryptoKey,
-    Buffer.from(signingInput)
-  );
-
-  const signatureB64 = Buffer.from(signature).toString("base64url");
-  const jwt = `${signingInput}.${signatureB64}`;
-
-  // Exchange JWT for access token
-  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion: jwt
-    })
-  });
-
-  const tokenData = await tokenResponse.json();
-  if (!tokenData.access_token) {
-    throw new Error(`Failed to get access token: ${JSON.stringify(tokenData)}`);
-  }
-
-  return tokenData.access_token;
-}
-
-// Consulta Google Calendar y retorna fechas ocupadas en los próximos 90 días
-async function getOccupiedDates(calendarId) {
-  try {
-    const accessToken = await getGoogleAccessToken();
-
-    const now = new Date();
-    const future = new Date();
-    future.setDate(future.getDate() + 90);
-
-    const params = new URLSearchParams({
-      timeMin: now.toISOString(),
-      timeMax: future.toISOString(),
-      singleEvents: "true",
-      orderBy: "startTime"
-    });
-
-    const response = await fetch(
-      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${params}`,
-      {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      }
-    );
-
-    const data = await response.json();
-
-    if (!data.items || data.items.length === 0) {
-      return { occupied: [], summary: "No hay reservas registradas en los próximos 90 días." };
-    }
-
-    const occupied = data.items.map(event => {
-      const start = event.start?.date || event.start?.dateTime?.split("T")[0];
-      const end = event.end?.date || event.end?.dateTime?.split("T")[0];
-      return { start, end, title: event.summary || "Reservado" };
-    });
-
-    // Construir resumen legible
-    const lines = occupied.map(e => {
-      const startDate = new Date(e.start + "T12:00:00");
-      const endDate = new Date(e.end + "T12:00:00");
-      const startStr = startDate.toLocaleDateString("es-MX", { day: "numeric", month: "long" });
-      const endStr = endDate.toLocaleDateString("es-MX", { day: "numeric", month: "long" });
-      return `• ${startStr} al ${endStr}`;
-    });
-
-    const summary = `Fechas ocupadas en los próximos 90 días:\n${lines.join("\n")}`;
-    return { occupied, summary };
-
-  } catch (err) {
-    console.error("Calendar error:", err.message);
-    return { occupied: [], summary: null, error: err.message };
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
 // DETECCIÓN INTELIGENTE DE PROPIEDAD
 // ─────────────────────────────────────────────────────────────
 async function detectPropertyFromMessage(userMessage, propertiesList) {
@@ -376,13 +237,273 @@ function formatForWhatsApp(text) {
     .trim();
 }
 
+// ─────────────────────────────────────────────────────────────
+// BOOKING FLOW — Extracción de datos estructurados
+// ─────────────────────────────────────────────────────────────
+
+// Campos requeridos para crear un HOLD, en orden de preferencia
+// LANI pide uno por uno siguiendo este orden
+const BOOKING_FIELDS_ORDER = [
+  "room_type",
+  "check_in",
+  "check_out",
+  "guests_count",
+  "guest_name",
+  "guest_email",
+  "guest_phone"
+];
+
+const FIELD_QUESTIONS_ES = {
+  room_type: "¿Qué tipo de habitación te interesa?",
+  check_in: "¿Cuál sería tu fecha de llegada (check-in)?",
+  check_out: "¿Y la fecha de salida (check-out)?",
+  guests_count: "¿Cuántas personas se hospedarían?",
+  guest_name: "¿Me confirmas tu nombre completo, por favor?",
+  guest_email: "¿Cuál es tu correo electrónico? Lo necesito para enviarte la confirmación.",
+  guest_phone: "¿Me confirmas un número de teléfono donde podamos contactarte?"
+};
+
+const FIELD_QUESTIONS_EN = {
+  room_type: "Which room type are you interested in?",
+  check_in: "What would be your check-in date?",
+  check_out: "And the check-out date?",
+  guests_count: "How many guests will be staying?",
+  guest_name: "Could you confirm your full name, please?",
+  guest_email: "What's your email address? I'll need it to send you the confirmation.",
+  guest_phone: "Could you share a phone number where we can reach you?"
+};
+
+function getTodayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function calculateNights(checkIn, checkOut) {
+  if (!checkIn || !checkOut) return null;
+  const a = new Date(checkIn);
+  const b = new Date(checkOut);
+  if (isNaN(a) || isNaN(b)) return null;
+  const diff = Math.round((b - a) / (1000 * 60 * 60 * 24));
+  return diff > 0 ? diff : null;
+}
+
+function calculateTotal(roomType, nights, roomRates) {
+  if (!roomType || !nights || !roomRates) return null;
+  const rate = roomRates[roomType.toLowerCase()] || roomRates[roomType];
+  if (!rate) return null;
+  return rate * nights;
+}
+
+function detectMissingFields(bookingData) {
+  const missing = [];
+  for (const field of BOOKING_FIELDS_ORDER) {
+    const value = bookingData[field];
+    if (value === undefined || value === null || value === "") {
+      missing.push(field);
+    }
+  }
+  return missing;
+}
+
+async function extractBookingData({
+  userMessage,
+  previousMessages,
+  activeBooking,
+  roomRates,
+  propertyName
+}) {
+  const todayISO = getTodayISO();
+  const ratesText = roomRates && Object.keys(roomRates).length > 0
+    ? Object.entries(roomRates).map(([k, v]) => `- ${k}: $${v}/night USD`).join("\n")
+    : "(no room rates configured)";
+
+  const activeBookingText = activeBooking && Object.keys(activeBooking).length > 0
+    ? JSON.stringify(activeBooking, null, 2)
+    : "(no booking in progress)";
+
+  const historyText = previousMessages.slice(-6).map(m => `${m.role}: ${m.content}`).join("\n");
+
+  const prompt = `You are a data extraction engine for a hotel booking system.
+
+PROPERTY: ${propertyName}
+TODAY'S DATE: ${todayISO}
+
+AVAILABLE ROOM TYPES AND RATES:
+${ratesText}
+
+CURRENT BOOKING IN PROGRESS (from previous turns, may be empty):
+${activeBookingText}
+
+RECENT CONVERSATION:
+${historyText}
+
+LATEST GUEST MESSAGE:
+"${userMessage}"
+
+YOUR TASK:
+Analyze the guest message AND the conversation history. Determine:
+
+1. Is the guest expressing intent to book a room? (intent: true/false)
+   - Phrases like "quiero reservar", "I want to book", "resérvame", "book me", "me interesa la habitación X del Y al Z" → intent: true
+   - General questions about prices, amenities, availability → intent: false
+   - If there's already an active booking in progress and the guest is providing more details → intent: true
+
+2. Extract any booking data present in the message AND merge with the active booking.
+   Fields to extract (only include if explicitly mentioned or already in active booking):
+   - room_type (string, must match one of the available room types — be flexible with synonyms)
+   - check_in (ISO date YYYY-MM-DD)
+   - check_out (ISO date YYYY-MM-DD)
+   - guests_count (integer)
+   - guest_name (string, full name if given)
+   - guest_email (string, valid email format)
+   - guest_phone (string, phone number)
+
+DATE PARSING RULES:
+- "del 15 al 18 de junio" with today being ${todayISO} → check_in: nearest future June 15, check_out: nearest future June 18
+- "next weekend", "este fin de semana", "mañana", "tomorrow" → calculate from ${todayISO}
+- If only one date given → only fill check_in, leave check_out null
+- If year is ambiguous, assume the nearest future occurrence
+
+ROOM TYPE MATCHING:
+- Match flexibly: "deluxe", "la deluxe", "habitación deluxe", "delux" → "deluxe"
+- "ocean view", "vista al mar", "con vista" → match closest in available rates
+- If guest asks for a type not in rates → set room_type to null and add note in extraction_notes
+
+CONFIDENCE:
+- Only include fields you are confident about
+- If a field is mentioned but unclear (e.g. "como 4 o 5 personas"), pick the higher number but flag in extraction_notes
+- Never invent emails, phones, or names
+
+RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
+{
+  "intent": true | false,
+  "data": {
+    "room_type": "..." | null,
+    "check_in": "YYYY-MM-DD" | null,
+    "check_out": "YYYY-MM-DD" | null,
+    "guests_count": number | null,
+    "guest_name": "..." | null,
+    "guest_email": "..." | null,
+    "guest_phone": "..." | null
+  },
+  "extraction_notes": "..." | null
+}`;
+
+  try {
+    const response = await fetch(ANTHROPIC_API, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 500,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+
+    const data = await response.json();
+    let text = data.content?.[0]?.text || "{}";
+
+    // Remove markdown fences if Claude added them
+    text = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+
+    const extracted = JSON.parse(text);
+
+    // Merge with activeBooking — extracted values override empty/null active ones
+    const mergedData = { ...(activeBooking || {}) };
+    for (const [key, value] of Object.entries(extracted.data || {})) {
+      if (value !== null && value !== undefined && value !== "") {
+        mergedData[key] = value;
+      }
+    }
+
+    return {
+      intent: extracted.intent === true,
+      data: mergedData,
+      extraction_notes: extracted.extraction_notes || null
+    };
+
+  } catch (err) {
+    console.error("extractBookingData error:", err);
+    return {
+      intent: false,
+      data: activeBooking || {},
+      extraction_notes: "extraction_failed"
+    };
+  }
+}
+
+function detectLanguage(text) {
+  // Simple heuristic: if message has strong Spanish markers, use ES
+  const spanishMarkers = /\b(hola|gracias|por favor|quiero|cuanto|cuándo|reservar|habitación|noche|días)\b/i;
+  return spanishMarkers.test(text) ? "es" : "en";
+}
+
+function buildBookingFlowResponse({
+  bookingData,
+  intent,
+  roomRates,
+  language
+}) {
+  // Compute nights and total if possible
+  const nights = calculateNights(bookingData.check_in, bookingData.check_out);
+  if (nights) bookingData.nights = nights;
+
+  const total = calculateTotal(bookingData.room_type, nights, roomRates);
+  if (total) bookingData.total_amount = total;
+
+  const missing = detectMissingFields(bookingData);
+
+  let stage;
+  let nextQuestion = null;
+  let suggestedReply = null;
+
+  if (!intent) {
+    stage = "NONE";
+  } else if (missing.length === 0) {
+    stage = "READY_TO_HOLD";
+  } else {
+    stage = "GATHERING_DATA";
+    nextQuestion = missing[0];
+    const questions = language === "es" ? FIELD_QUESTIONS_ES : FIELD_QUESTIONS_EN;
+    suggestedReply = questions[nextQuestion];
+
+    // Si lo siguiente es room_type y hay rates configurados, agregar opciones
+    if (nextQuestion === "room_type" && roomRates && Object.keys(roomRates).length > 0) {
+      const roomList = Object.entries(roomRates)
+        .map(([k, v]) => `- ${k.charAt(0).toUpperCase() + k.slice(1)}: $${v} USD/noche`)
+        .join("\n");
+      suggestedReply = language === "es"
+        ? `${suggestedReply}\n\nTenemos disponibles:\n${roomList}`
+        : `${suggestedReply}\n\nWe have available:\n${roomList}`;
+    }
+  }
+
+  return {
+    intent,
+    stage,
+    data: bookingData,
+    missing_fields: missing,
+    next_question: nextQuestion,
+    suggested_reply: suggestedReply,
+    total_amount: bookingData.total_amount || null,
+    nights: bookingData.nights || null
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// HANDLER PRINCIPAL
+// ─────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
 
   try {
-    let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw, calendarId;
+    let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw;
+    let activeBookingRaw, roomRatesRaw, propertyName;
 
     const contentType = event.headers["content-type"] || "";
 
@@ -394,7 +515,9 @@ exports.handler = async (event) => {
       ownerWhatsapp     = params.get("ownerWhatsapp") || "";
       propertyId        = params.get("propertyId") || "";
       propertiesListRaw = params.get("propertiesList") || "[]";
-      calendarId        = params.get("calendarId") || "";
+      activeBookingRaw  = params.get("activeBooking") || "{}";
+      roomRatesRaw      = params.get("roomRates") || "{}";
+      propertyName      = params.get("propertyName") || "";
     } else {
       const body = JSON.parse(event.body);
       systemPrompt      = body.systemPrompt || "";
@@ -403,7 +526,9 @@ exports.handler = async (event) => {
       ownerWhatsapp     = body.ownerWhatsapp || "";
       propertyId        = body.propertyId || "";
       propertiesListRaw = body.propertiesList || "[]";
-      calendarId        = body.calendarId || "";
+      activeBookingRaw  = body.activeBooking || "{}";
+      roomRatesRaw      = body.roomRates || "{}";
+      propertyName      = body.propertyName || "";
     }
 
     if (!userMessage) {
@@ -417,6 +542,15 @@ exports.handler = async (event) => {
     // Parsear lista completa de propiedades
     let propertiesList = [];
     try { propertiesList = JSON.parse(propertiesListRaw); } catch (e) { propertiesList = []; }
+
+    // Parsear activeBooking y roomRates
+    let activeBooking = {};
+    try { activeBooking = typeof activeBookingRaw === 'string' ? JSON.parse(activeBookingRaw) : activeBookingRaw; } catch (e) { activeBooking = {}; }
+    if (!activeBooking || typeof activeBooking !== 'object') activeBooking = {};
+
+    let roomRates = {};
+    try { roomRates = typeof roomRatesRaw === 'string' ? JSON.parse(roomRatesRaw) : roomRatesRaw; } catch (e) { roomRates = {}; }
+    if (!roomRates || typeof roomRates !== 'object') roomRates = {};
 
     // ─────────────────────────────────────────────
     // MODO IDENTIFICACIÓN — no hay propertyId aún
@@ -457,7 +591,8 @@ exports.handler = async (event) => {
               updatedHistory: JSON.stringify(updatedMessages),
               needsEscalation: false,
               escalationKeyword: null,
-              detectedPropertyId: detected
+              detectedPropertyId: detected,
+              bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null }
             })
           };
         }
@@ -482,7 +617,8 @@ exports.handler = async (event) => {
             updatedHistory: JSON.stringify(updatedMessages),
             needsEscalation: false,
             escalationKeyword: null,
-            detectedPropertyId: null
+            detectedPropertyId: null,
+            bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null }
           })
         };
       }
@@ -506,7 +642,8 @@ exports.handler = async (event) => {
           updatedHistory: JSON.stringify(updatedMessages),
           needsEscalation: false,
           escalationKeyword: null,
-          detectedPropertyId: null
+          detectedPropertyId: null,
+          bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null }
         })
       };
     }
@@ -520,21 +657,6 @@ exports.handler = async (event) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ error: "Missing systemPrompt for known property" })
       };
-    }
-
-    // ─────────────────────────────────────────────
-    // CONSULTA DE DISPONIBILIDAD EN GOOGLE CALENDAR
-    // Solo si el mensaje pregunta sobre fechas y hay calendarId
-    // ─────────────────────────────────────────────
-    let availabilityContext = "";
-
-    if (calendarId && isAvailabilityQuestion(userMessage)) {
-      const { summary, error } = await getOccupiedDates(calendarId);
-      if (summary) {
-        availabilityContext = `\n\nREAL-TIME AVAILABILITY DATA (from Google Calendar):\n${summary}\nUse this data to answer any availability questions. If the guest's requested dates are not in the occupied list, they are available.`;
-      } else if (error) {
-        console.error("Calendar fetch error:", error);
-      }
     }
 
     // Parsear historial
@@ -570,8 +692,34 @@ exports.handler = async (event) => {
     }
 
     // ─────────────────────────────────────────────
+    // BOOKING EXTRACTION (paralelo a la respuesta de LANI)
+    // ─────────────────────────────────────────────
+    const language = detectLanguage(userMessage);
+    let bookingFlow = { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null };
+
+    try {
+      const extraction = await extractBookingData({
+        userMessage,
+        previousMessages,
+        activeBooking,
+        roomRates,
+        propertyName: propertyName || "this property"
+      });
+
+      bookingFlow = buildBookingFlowResponse({
+        bookingData: extraction.data,
+        intent: extraction.intent,
+        roomRates,
+        language
+      });
+
+      bookingFlow.extraction_notes = extraction.extraction_notes;
+    } catch (err) {
+      console.error("Booking extraction failed:", err);
+    }
+
+    // ─────────────────────────────────────────────
     // REGLA DE INTEGRIDAD DE DATOS
-    // Evita que LANI invente información no provista
     // ─────────────────────────────────────────────
     const dataIntegrityRule = `
 
@@ -583,9 +731,48 @@ NEVER invent, assume, or borrow details from other properties or your general kn
 If a field is empty or not mentioned in this prompt, treat it as unknown — do not fill in the gap.
 This rule overrides everything else.`;
 
+    // ─────────────────────────────────────────────
+    // BOOKING CONTEXT INJECTION
+    // ─────────────────────────────────────────────
+    let bookingContext = "";
+
+    if (bookingFlow.intent && bookingFlow.stage === "GATHERING_DATA") {
+      const fieldsCollected = Object.entries(bookingFlow.data)
+        .filter(([k, v]) => v !== null && v !== undefined && v !== "")
+        .map(([k, v]) => `${k}: ${v}`)
+        .join(", ");
+
+      bookingContext = `
+
+BOOKING FLOW ACTIVE — GATHERING DATA:
+The guest is in the middle of making a booking. You have collected so far: ${fieldsCollected || "(nothing yet)"}.
+You still need to ask for: ${bookingFlow.next_question}.
+
+CRITICAL: Your reply must naturally ask for the next field (${bookingFlow.next_question}). 
+Suggested phrasing: "${bookingFlow.suggested_reply}"
+You may adapt the phrasing to sound natural in context, but MUST ask only for this one field.
+Do NOT confirm the booking yet. Do NOT mention payment yet. Just gather the next piece of info conversationally.
+Keep the warm, friendly tone of the property.`;
+    } else if (bookingFlow.intent && bookingFlow.stage === "READY_TO_HOLD") {
+      const total = bookingFlow.total_amount;
+      const nights = bookingFlow.nights;
+      bookingContext = `
+
+BOOKING FLOW ACTIVE — READY TO HOLD:
+The guest has provided all booking details. Total: $${total} USD for ${nights} nights.
+
+CRITICAL: Your reply should:
+1. Briefly summarize the booking (name, dates, room type, guests, total)
+2. Say you are checking availability right now (it will be confirmed in seconds by the system)
+3. Do NOT promise payment options yet — the system will handle that next
+4. Keep it warm and natural, 3-4 lines max.
+
+Example tone: "Perfecto Juan, déjame confirmar disponibilidad para la Deluxe del 15 al 18 de junio (3 noches, $450 USD para 2 personas). Un segundo..."`;
+    }
+
     const fullSystemPrompt = conversationSummary
-      ? `${systemPrompt}${dataIntegrityRule}${availabilityContext}\n\nConversation summary so far: ${conversationSummary}`
-      : `${systemPrompt}${dataIntegrityRule}${availabilityContext}`;
+      ? `${systemPrompt}${dataIntegrityRule}${bookingContext}\n\nConversation summary so far: ${conversationSummary}`
+      : `${systemPrompt}${dataIntegrityRule}${bookingContext}`;
 
     const messages = [
       ...previousMessages,
@@ -660,7 +847,8 @@ This rule overrides everything else.`;
         escalationKeyword: needsEscalation
           ? ESCALATION_KEYWORDS.find(k => userMessage.toLowerCase().includes(k))
           : null,
-        detectedPropertyId: null
+        detectedPropertyId: null,
+        bookingFlow: bookingFlow
       })
     };
 
