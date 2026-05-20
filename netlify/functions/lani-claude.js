@@ -758,17 +758,44 @@ function validateReadyToHold(bookingData, roomRates) {
 // que Make va a usar para crear el HOLD en Calendar + Bookings sheet.
 // ═══════════════════════════════════════════════════════════════════
 function buildBookingDataPayload(bookingData, roomRates, nights, language) {
-  // Normalizar room_type a la clave que usa roomRates
-  const roomKey = bookingData.room_type.toLowerCase();
-  const pricePerNight = roomRates[roomKey] || roomRates[bookingData.room_type];
+  // Normalizar room_type — buscar la clave en roomRates con varias variantes
+  // para ser robusto a cómo viene la data desde Properties sheet via Make.
+  const roomTypeRaw = bookingData.room_type || "";
+  const roomKey = roomTypeRaw.toLowerCase().replace(/\s+/g, "_");
+
+  // Intentar varias variantes para encontrar el precio
+  let pricePerNight =
+    roomRates[roomKey] ||
+    roomRates[roomTypeRaw] ||
+    roomRates[roomTypeRaw.toLowerCase()] ||
+    roomRates[roomTypeRaw.replace(/_/g, " ")] ||
+    null;
+
+  // Si aún no encontramos, intentar match case-insensitive en las claves
+  if (!pricePerNight && roomRates && Object.keys(roomRates).length > 0) {
+    const normalizedTarget = roomKey;
+    for (const [k, v] of Object.entries(roomRates)) {
+      const normalizedKey = k.toLowerCase().replace(/\s+/g, "_");
+      if (normalizedKey === normalizedTarget) {
+        pricePerNight = v;
+        break;
+      }
+    }
+  }
 
   // Etiqueta de display del room_type (Title Case desde la clave)
-  const roomDisplay = bookingData.room_type
+  const roomDisplay = roomTypeRaw
     .split(/[_\s]+/)
     .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
     .join(" ");
 
-  const subtotal = pricePerNight * nights;
+  // FIX BUG total_amount: usar el valor ya calculado en bookingData.total_amount
+  // como fallback si el cálculo aquí falla (defensa en profundidad).
+  const subtotal = (pricePerNight && nights)
+    ? pricePerNight * nights
+    : (bookingData.total_amount || 0);
+
+  const totalAmount = bookingData.total_amount || subtotal;
 
   return {
     guest_name: bookingData.guest_name,
@@ -782,11 +809,11 @@ function buildBookingDataPayload(bookingData, roomRates, nights, language) {
       {
         room_type: roomDisplay,
         room_key: roomKey,
-        price_per_night: pricePerNight,
+        price_per_night: pricePerNight || 0,
         subtotal: subtotal
       }
     ],
-    total_amount: subtotal,
+    total_amount: totalAmount,
     language: language
   };
 }
