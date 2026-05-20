@@ -389,7 +389,30 @@ function calculateNights(checkIn, checkOut) {
 
 function calculateTotal(roomType, nights, roomRates) {
   if (!roomType || !nights || !roomRates) return null;
-  const rate = roomRates[roomType.toLowerCase()] || roomRates[roomType];
+
+  // Normalizar el roomType a varias variantes para máxima robustez
+  const roomTypeRaw = roomType;
+  const roomKey = roomTypeRaw.toLowerCase().replace(/\s+/g, "_");
+
+  // Intentar varias variantes
+  let rate =
+    roomRates[roomKey] ||
+    roomRates[roomTypeRaw] ||
+    roomRates[roomTypeRaw.toLowerCase()] ||
+    roomRates[roomTypeRaw.replace(/_/g, " ")] ||
+    null;
+
+  // Si aún no encontramos, hacer match case-insensitive normalizado
+  if (!rate && Object.keys(roomRates).length > 0) {
+    for (const [k, v] of Object.entries(roomRates)) {
+      const normalizedKey = k.toLowerCase().replace(/\s+/g, "_");
+      if (normalizedKey === roomKey) {
+        rate = v;
+        break;
+      }
+    }
+  }
+
   if (!rate) return null;
   return rate * nights;
 }
@@ -737,7 +760,26 @@ function validateReadyToHold(bookingData, roomRates) {
 
   // 7. Room type existe en rates
   if (bookingData.room_type && roomRates && Object.keys(roomRates).length > 0) {
-    const rate = roomRates[bookingData.room_type.toLowerCase()] || roomRates[bookingData.room_type];
+    const roomTypeRaw = bookingData.room_type;
+    const roomKey = roomTypeRaw.toLowerCase().replace(/\s+/g, "_");
+
+    let rate =
+      roomRates[roomKey] ||
+      roomRates[roomTypeRaw] ||
+      roomRates[roomTypeRaw.toLowerCase()] ||
+      roomRates[roomTypeRaw.replace(/_/g, " ")] ||
+      null;
+
+    if (!rate) {
+      for (const [k, v] of Object.entries(roomRates)) {
+        const normalizedKey = k.toLowerCase().replace(/\s+/g, "_");
+        if (normalizedKey === roomKey) {
+          rate = v;
+          break;
+        }
+      }
+    }
+
     if (!rate) errors.push(`room_type "${bookingData.room_type}" not in rates`);
   }
 
