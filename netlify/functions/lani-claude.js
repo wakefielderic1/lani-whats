@@ -676,6 +676,121 @@ function detectLanguage(text) {
   return spanishMarkers.test(text) ? "es" : "en";
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// FASE 3 — VALIDACIÓN ESTRICTA DE READY_TO_HOLD
+// Antes de declarar READY_TO_HOLD, verificamos que TODOS los datos
+// estén bien formateados. Si algo falla, downgrade a GATHERING_DATA.
+// ═══════════════════════════════════════════════════════════════════
+function validateReadyToHold(bookingData, roomRates) {
+  const errors = [];
+
+  // 1. Campos requeridos presentes
+  if (!bookingData.room_type) errors.push("room_type missing");
+  if (!bookingData.check_in) errors.push("check_in missing");
+  if (!bookingData.check_out) errors.push("check_out missing");
+  if (!bookingData.guests_count || bookingData.guests_count <= 0) errors.push("guests_count invalid");
+  if (!bookingData.guest_name) errors.push("guest_name missing");
+  if (!bookingData.guest_email) errors.push("guest_email missing");
+  if (!bookingData.guest_phone) errors.push("guest_phone missing");
+
+  // 2. Formato de fechas YYYY-MM-DD
+  const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+  if (bookingData.check_in && !dateRegex.test(bookingData.check_in)) {
+    errors.push("check_in format invalid");
+  }
+  if (bookingData.check_out && !dateRegex.test(bookingData.check_out)) {
+    errors.push("check_out format invalid");
+  }
+
+  // 3. check_out estrictamente después de check_in
+  if (bookingData.check_in && bookingData.check_out) {
+    const inDate = new Date(bookingData.check_in);
+    const outDate = new Date(bookingData.check_out);
+    if (isNaN(inDate) || isNaN(outDate)) {
+      errors.push("dates unparseable");
+    } else if (outDate <= inDate) {
+      errors.push("check_out must be after check_in");
+    }
+  }
+
+  // 4. check_in no en el pasado (con tolerancia de 1 día por zonas horarias)
+  if (bookingData.check_in && dateRegex.test(bookingData.check_in)) {
+    const inDate = new Date(bookingData.check_in);
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (inDate < yesterday) {
+      errors.push("check_in is in the past");
+    }
+  }
+
+  // 5. Email con formato razonable
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (bookingData.guest_email && !emailRegex.test(bookingData.guest_email)) {
+    errors.push("guest_email format invalid");
+  }
+
+  // 6. Teléfono con al menos 8 dígitos
+  if (bookingData.guest_phone) {
+    const phoneDigits = String(bookingData.guest_phone).replace(/\D/g, "");
+    if (phoneDigits.length < 8) errors.push("guest_phone too short");
+  }
+
+  // 7. Room type existe en rates
+  if (bookingData.room_type && roomRates && Object.keys(roomRates).length > 0) {
+    const rate = roomRates[bookingData.room_type.toLowerCase()] || roomRates[bookingData.room_type];
+    if (!rate) errors.push(`room_type "${bookingData.room_type}" not in rates`);
+  }
+
+  // 8. guests_count razonable
+  if (bookingData.guests_count && (bookingData.guests_count < 1 || bookingData.guests_count > 50)) {
+    errors.push("guests_count out of reasonable range");
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FASE 3 — CONSTRUCTOR DE booking_data PARA MAKE
+// Cuando READY_TO_HOLD es válido, generamos el objeto estructurado
+// que Make va a usar para crear el HOLD en Calendar + Bookings sheet.
+// ═══════════════════════════════════════════════════════════════════
+function buildBookingDataPayload(bookingData, roomRates, nights, language) {
+  // Normalizar room_type a la clave que usa roomRates
+  const roomKey = bookingData.room_type.toLowerCase();
+  const pricePerNight = roomRates[roomKey] || roomRates[bookingData.room_type];
+
+  // Etiqueta de display del room_type (Title Case desde la clave)
+  const roomDisplay = bookingData.room_type
+    .split(/[_\s]+/)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+
+  const subtotal = pricePerNight * nights;
+
+  return {
+    guest_name: bookingData.guest_name,
+    guest_email: bookingData.guest_email,
+    guest_phone: bookingData.guest_phone,
+    check_in: bookingData.check_in,
+    check_out: bookingData.check_out,
+    nights: nights,
+    guests_count: bookingData.guests_count,
+    rooms: [
+      {
+        room_type: roomDisplay,
+        room_key: roomKey,
+        price_per_night: pricePerNight,
+        subtotal: subtotal
+      }
+    ],
+    total_amount: subtotal,
+    language: language
+  };
+}
+
 function buildBookingFlowResponse({
   bookingData,
   intent,
@@ -693,11 +808,33 @@ function buildBookingFlowResponse({
   let stage;
   let nextQuestion = null;
   let suggestedReply = null;
+  let bookingDataPayload = null;   // ← FASE 3: nuevo campo
+  let validationErrors = null;      // ← FASE 3: nuevo campo para debug
 
   if (!intent) {
     stage = "NONE";
   } else if (missing.length === 0) {
-    stage = "READY_TO_HOLD";
+    // ─────────────────────────────────────────────────────────────
+    // FASE 3 — Antes de declarar READY_TO_HOLD, validar estrictamente
+    // ─────────────────────────────────────────────────────────────
+    const validation = validateReadyToHold(bookingData, roomRates);
+
+    if (validation.valid) {
+      stage = "READY_TO_HOLD";
+      bookingDataPayload = buildBookingDataPayload(bookingData, roomRates, nights, language);
+    } else {
+      // Si hay error de validación, no declarar READY_TO_HOLD.
+      // Volver a GATHERING_DATA con el primer campo problemático.
+      console.warn("[LANI] READY_TO_HOLD validation failed:", validation.errors);
+      stage = "GATHERING_DATA";
+      validationErrors = validation.errors;
+      // El primer campo missing real (ya están todos llenos), así que
+      // pedimos confirmación general en lugar de un campo específico.
+      nextQuestion = "confirmation";
+      suggestedReply = language === "es"
+        ? "¿Me confirmas los datos de tu reserva antes de apartarla?"
+        : "Could you confirm your booking details before I place the hold?";
+    }
   } else {
     stage = "GATHERING_DATA";
     nextQuestion = missing[0];
@@ -722,7 +859,11 @@ function buildBookingFlowResponse({
     next_question: nextQuestion,
     suggested_reply: suggestedReply,
     total_amount: bookingData.total_amount || null,
-    nights: bookingData.nights || null
+    nights: bookingData.nights || null,
+    // ─── FASE 3 — Campos nuevos ─────────────────────────────────
+    booking_data: bookingDataPayload,        // estructurado para Make (null si no READY_TO_HOLD)
+    language: language,                       // detectado de la conversación
+    validation_errors: validationErrors       // null si todo bien, array si falló validación
   };
 }
 
@@ -828,7 +969,7 @@ exports.handler = async (event) => {
               needsEscalation: category === "EMERGENCY",
               escalationKeyword: null,
               detectedPropertyId: null,
-              bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null }
+              bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null }
             })
           };
         }
@@ -857,7 +998,7 @@ exports.handler = async (event) => {
               needsEscalation: false,
               escalationKeyword: null,
               detectedPropertyId: detected,
-              bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null }
+              bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null }
             })
           };
         }
@@ -883,7 +1024,7 @@ exports.handler = async (event) => {
             needsEscalation: false,
             escalationKeyword: null,
             detectedPropertyId: null,
-            bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null }
+            bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null }
           })
         };
       }
@@ -908,7 +1049,7 @@ exports.handler = async (event) => {
           needsEscalation: false,
           escalationKeyword: null,
           detectedPropertyId: null,
-          bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null }
+          bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null }
         })
       };
     }
@@ -955,7 +1096,7 @@ exports.handler = async (event) => {
     }
 
     const language = detectLanguage(userMessage);
-    let bookingFlow = { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null };
+    let bookingFlow = { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: language, validation_errors: null };
 
     try {
       const extraction = await extractBookingData({
@@ -1018,12 +1159,15 @@ The guest has provided all booking details. Total: $${total} USD for ${nights} n
 
 CRITICAL: Your reply should:
 1. Briefly summarize the booking (name, dates, room type, guests, total)
-2. Say you are confirming the dates right now (the system will verify availability in seconds)
-3. Do NOT say "you've secured the dates" yet — say "I'm confirming the dates"
-4. Do NOT mention payment options yet — the system will handle that next
-5. Keep it warm and natural, 3-4 lines max.
+2. Say you are checking availability right now (the system will verify in seconds)
+3. Mention they will have 30 minutes to complete payment to lock the booking once availability is confirmed
+4. Do NOT say "you've secured the dates" yet — say "I'm checking availability" or "placing a hold"
+5. Do NOT include a payment link — the system will send it next
+6. Keep it warm and natural, 3-5 lines max.
 
-Example tone: "Perfecto Juan, déjame confirmar la disponibilidad para la Garden Room del 15 al 18 de junio (3 noches, $270 USD para 2 personas). Un segundo..."`;
+Example tone (Spanish): "Perfecto Juan 🌴 Te voy a apartar la Garden Room del 15 al 18 de junio (3 noches, $270 USD para 2 personas). Estoy confirmando disponibilidad — en cuanto la confirme te paso el link de pago, y vas a tener 30 minutos para completarlo y dejar la reserva lista."
+
+Example tone (English): "Perfect Juan 🌴 Placing a hold for Garden Room June 15–18 (3 nights, $270 USD for 2 guests). I'm confirming availability now — once confirmed I'll send the payment link, and you'll have 30 minutes to complete it to lock the booking in."`;
     }
 
     const fullSystemPrompt = conversationSummary
