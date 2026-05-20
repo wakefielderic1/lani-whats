@@ -47,9 +47,9 @@ async function summarizeHistory(messages, systemPrompt) {
   return data.content?.[0]?.text || "";
 }
 
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // DETECCIÓN INTELIGENTE DE PROPIEDAD
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 async function detectPropertyFromMessage(userMessage, propertiesList) {
   const propertiesText = propertiesList.map((p, i) =>
     `${i + 1}. property_id: "${p.property_id}" | name: "${p.name}" | location: "${p.location || ""}"`
@@ -114,9 +114,9 @@ No explanation. No punctuation. No other text.`;
   return (data.content?.[0]?.text || "NONE").trim();
 }
 
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // NORMALIZACIÓN DE PAÍSES
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 const COUNTRY_ALIASES = {
   "usa": "United States", "us": "United States", "united states": "United States",
   "united states of america": "United States", "estados unidos": "United States",
@@ -200,9 +200,9 @@ function buildSelectionMessage(propertiesList, filterLocation) {
   return { optionsText: optionsText.trim(), flatList };
 }
 
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // LIMPIEZA DE MARKDOWN PARA WHATSAPP
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 function stripMarkdown(text) {
   return text
     .replace(/\*\*(.+?)\*\*/g, '$1')
@@ -237,9 +237,9 @@ function formatForWhatsApp(text) {
     .trim();
 }
 
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // BOOKING FLOW — Extracción de datos estructurados
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
 // Campos requeridos para crear un HOLD, en orden de preferencia
 // LANI pide uno por uno siguiendo este orden
@@ -252,23 +252,6 @@ const BOOKING_FIELDS_ORDER = [
   "guest_email",
   "guest_phone"
 ];
-
-// Labels presentables para tipos de habitación
-// internal_key → display label
-const ROOM_TYPE_LABELS = {
-  "garden_room": "Garden Room",
-  "ocean_view": "Ocean View",
-  "villa": "Villa"
-};
-
-function formatRoomLabel(internalKey) {
-  if (ROOM_TYPE_LABELS[internalKey]) return ROOM_TYPE_LABELS[internalKey];
-  // fallback: capitalizar y quitar underscores
-  return internalKey
-    .split("_")
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(" ");
-}
 
 const FIELD_QUESTIONS_ES = {
   room_type: "¿Qué tipo de habitación te interesa?",
@@ -321,6 +304,15 @@ function detectMissingFields(bookingData) {
   return missing;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// FIX BUG DE MEMORIA — extractBookingData v2
+// Esta versión:
+// 1. Lee TODO el historial conversacional (no solo últimos 6 mensajes)
+// 2. Reconstruye el booking desde el historial (no depende solo de
+//    activeBooking que viene de Make)
+// 3. Le da al extractor instrucciones más fuertes para acumular datos
+//    a través de turnos y manejar correcciones mid-flow
+// ═══════════════════════════════════════════════════════════════════
 async function extractBookingData({
   userMessage,
   previousMessages,
@@ -333,11 +325,21 @@ async function extractBookingData({
     ? Object.entries(roomRates).map(([k, v]) => `- ${k}: $${v}/night USD`).join("\n")
     : "(no room rates configured)";
 
-  const activeBookingText = activeBooking && Object.keys(activeBooking).length > 0
-    ? JSON.stringify(activeBooking, null, 2)
-    : "(no booking in progress)";
+  // ─────────────────────────────────────────────────────────────────
+  // RECONSTRUIR EL BOOKING DESDE EL HISTORIAL
+  // No confiamos solo en lo que mande Make. Leemos toda la
+  // conversación para recuperar datos ya mencionados.
+  // ─────────────────────────────────────────────────────────────────
+  const reconstructedBooking = { ...(activeBooking || {}) };
 
-  const historyText = previousMessages.slice(-6).map(m => `${m.role}: ${m.content}`).join("\n");
+  // Pasamos historial completo (no solo últimos 6) al prompt
+  const fullHistoryText = previousMessages
+    .map(m => `${m.role}: ${m.content}`)
+    .join("\n");
+
+  const activeBookingText = Object.keys(reconstructedBooking).length > 0
+    ? JSON.stringify(reconstructedBooking, null, 2)
+    : "(no prior booking data passed in, but ALWAYS check conversation history below)";
 
   const prompt = `You are a data extraction engine for a hotel booking system.
 
@@ -347,53 +349,85 @@ TODAY'S DATE: ${todayISO}
 AVAILABLE ROOM TYPES AND RATES:
 ${ratesText}
 
-CURRENT BOOKING IN PROGRESS (from previous turns, may be empty):
+CURRENT BOOKING DATA PASSED IN (may be empty — DO NOT rely on this alone):
 ${activeBookingText}
 
-RECENT CONVERSATION:
-${historyText}
+═══════════════════════════════════════════════════════════════
+FULL CONVERSATION HISTORY (THIS IS YOUR SOURCE OF TRUTH):
+${fullHistoryText || "(no prior messages)"}
+═══════════════════════════════════════════════════════════════
 
 LATEST GUEST MESSAGE:
 "${userMessage}"
 
-YOUR TASK:
-Analyze the guest message AND the conversation history. Determine:
+═══════════════════════════════════════════════════════════════
+CRITICAL EXTRACTION RULES:
+═══════════════════════════════════════════════════════════════
 
-1. Is the guest expressing intent to book a room? (intent: true/false)
-   - Phrases like "quiero reservar", "I want to book", "resérvame", "book me", "me interesa la habitación X del Y al Z" → intent: true
-   - General questions about prices, amenities, availability → intent: false
-   - If there's already an active booking in progress and the guest is providing more details → intent: true
+1. READ THE ENTIRE CONVERSATION HISTORY. Booking data may have been 
+   given turns ago. NEVER discard information just because the 
+   latest message doesn't repeat it.
 
-2. Extract any booking data present in the message AND merge with the active booking.
-   Fields to extract (only include if explicitly mentioned or already in active booking):
-   - room_type (string, must match one of the available room types — be flexible with synonyms)
+2. ACCUMULATE data across turns:
+   - If the guest said "garden room" 3 messages ago and now says 
+     "yes, that's the one" → room_type STAYS as "garden_room"
+   - If they gave dates earlier and now give their name → KEEP the 
+     dates, add the name
+   - Treat each turn as ADDING info, not REPLACING it
+
+3. HANDLE CORRECTIONS gracefully:
+   - "actually make it 4 people" → update guests_count to 4
+   - "wait, change to ocean view" → update room_type to ocean_view
+   - "no, 16th not 15th" → update check_in
+   - Only update fields the guest EXPLICITLY corrected. Keep all others.
+
+4. INTENT detection:
+   - Phrases like "quiero reservar", "I want to book", "resérvame", 
+     "book me" → intent: true
+   - General questions about prices, amenities, availability → 
+     intent: false
+   - IF the conversation history shows a booking already in progress 
+     (any booking field has a value) → intent: true, even if the 
+     latest message is just confirming or providing one more piece 
+     of data ("yes", "Daniel Arevalo", "daniel@test.com")
+
+5. FIELDS TO EXTRACT:
+   - room_type (string, must match one of: ${Object.keys(roomRates).join(", ") || "any"})
    - check_in (ISO date YYYY-MM-DD)
    - check_out (ISO date YYYY-MM-DD)
    - guests_count (integer)
-   - guest_name (string, full name if given)
-   - guest_email (string, valid email format)
+   - guest_name (string, full name)
+   - guest_email (string, valid email)
    - guest_phone (string, phone number)
 
-DATE PARSING RULES:
-- "del 15 al 18 de junio" with today being ${todayISO} → check_in: nearest future June 15, check_out: nearest future June 18
-- "next weekend", "este fin de semana", "mañana", "tomorrow" → calculate from ${todayISO}
-- If only one date given → only fill check_in, leave check_out null
-- If year is ambiguous, assume the nearest future occurrence
+6. DATE PARSING:
+   - "del 15 al 18 de junio" with today being ${todayISO} → 
+     check_in: nearest future June 15, check_out: nearest future June 18
+   - "next weekend", "este fin de semana", "mañana", "tomorrow" → 
+     calculate from ${todayISO}
+   - If only one date given → fill check_in, leave check_out null
 
-ROOM TYPE MATCHING:
-- The available room types are INTERNAL KEYS like "garden_room", "ocean_view", "villa".
-- Map flexibly from guest phrasing to the correct internal key:
-  * "garden room", "garden", "jardín", "habitación jardín", "la garden", "el garden room" → "garden_room"
-  * "ocean view", "ocean", "vista al mar", "con vista", "la ocean", "el ocean view", "vista mar" → "ocean_view"
-  * "villa", "la villa", "private villa", "the villa" → "villa"
-- ALWAYS return the internal_key (with underscores), NEVER the display label.
-- If guest asks for a type not in the available rates → set room_type to null and add note in extraction_notes
-- IMPORTANT: only consider types that appear in the AVAILABLE ROOM TYPES AND RATES list above. If a type has no price listed, it's not available.
+7. ROOM TYPE MATCHING (be flexible):
+   - "garden", "la garden", "the garden one", "garden room por fa" → 
+     room_type: "garden_room"
+   - "ocean view", "vista al mar", "con vista" → "ocean_view"
+   - "villa", "private villa", "la villa" → "villa"
+   - If guest asks for a type NOT in available rates → set room_type 
+     to null and note in extraction_notes
 
-CONFIDENCE:
-- Only include fields you are confident about
-- If a field is mentioned but unclear (e.g. "como 4 o 5 personas"), pick the higher number but flag in extraction_notes
-- Never invent emails, phones, or names
+8. CONFIDENCE:
+   - Only fill fields you are CONFIDENT about
+   - If unclear ("como 4 o 5 personas"), pick the higher number and 
+     note it in extraction_notes
+   - NEVER invent emails, phones, or names
+
+9. INPUT VALIDATION:
+   - guest_email: must look like email (has @ and a dot)
+   - guest_phone: must have digits (8+ characters typically)
+   - guests_count: must be a positive integer 1-20
+   - If a value doesn't pass validation → leave as null
+
+═══════════════════════════════════════════════════════════════
 
 RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
 {
@@ -433,8 +467,10 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
 
     const extracted = JSON.parse(text);
 
-    // Merge with activeBooking — extracted values override empty/null active ones
-    const mergedData = { ...(activeBooking || {}) };
+    // ─────────────────────────────────────────────────────────────
+    // MERGE: extracted values override empty/null in reconstructed
+    // ─────────────────────────────────────────────────────────────
+    const mergedData = { ...reconstructedBooking };
     for (const [key, value] of Object.entries(extracted.data || {})) {
       if (value !== null && value !== undefined && value !== "") {
         mergedData[key] = value;
@@ -494,18 +530,12 @@ function buildBookingFlowResponse({
 
     // Si lo siguiente es room_type y hay rates configurados, agregar opciones
     if (nextQuestion === "room_type" && roomRates && Object.keys(roomRates).length > 0) {
-      // Filtrar solo tipos con precio válido (> 0)
-      const availableTypes = Object.entries(roomRates)
-        .filter(([k, v]) => v && Number(v) > 0);
-
-      if (availableTypes.length > 0) {
-        const roomList = availableTypes
-          .map(([k, v]) => `- ${formatRoomLabel(k)}: $${v} USD/noche`)
-          .join("\n");
-        suggestedReply = language === "es"
-          ? `${suggestedReply}\n\nTenemos disponibles:\n${roomList}`
-          : `${suggestedReply}\n\nWe have available:\n${roomList.replace(/\/noche/g, '/night')}`;
-      }
+      const roomList = Object.entries(roomRates)
+        .map(([k, v]) => `- ${k.charAt(0).toUpperCase() + k.slice(1)}: $${v} USD/noche`)
+        .join("\n");
+      suggestedReply = language === "es"
+        ? `${suggestedReply}\n\nTenemos disponibles:\n${roomList}`
+        : `${suggestedReply}\n\nWe have available:\n${roomList}`;
     }
   }
 
@@ -521,9 +551,9 @@ function buildBookingFlowResponse({
   };
 }
 
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // HANDLER PRINCIPAL
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
@@ -580,9 +610,9 @@ exports.handler = async (event) => {
     try { roomRates = typeof roomRatesRaw === 'string' ? JSON.parse(roomRatesRaw) : roomRatesRaw; } catch (e) { roomRates = {}; }
     if (!roomRates || typeof roomRates !== 'object') roomRates = {};
 
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     // MODO IDENTIFICACIÓN — no hay propertyId aún
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     if (!propertyId && propertiesList.length > 0) {
 
       let pendingFlatList = null;
@@ -676,9 +706,9 @@ exports.handler = async (event) => {
       };
     }
 
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     // MODO NORMAL — propertyId existe, responder como LANI
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     if (!systemPrompt) {
       return {
         statusCode: 400,
@@ -719,9 +749,9 @@ exports.handler = async (event) => {
       previousMessages = [];
     }
 
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     // BOOKING EXTRACTION (paralelo a la respuesta de LANI)
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     const language = detectLanguage(userMessage);
     let bookingFlow = { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null };
 
@@ -746,9 +776,9 @@ exports.handler = async (event) => {
       console.error("Booking extraction failed:", err);
     }
 
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     // REGLA DE INTEGRIDAD DE DATOS
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     const dataIntegrityRule = `
 
 CRITICAL RULE — DATA INTEGRITY:
@@ -759,9 +789,9 @@ NEVER invent, assume, or borrow details from other properties or your general kn
 If a field is empty or not mentioned in this prompt, treat it as unknown — do not fill in the gap.
 This rule overrides everything else.`;
 
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     // BOOKING CONTEXT INJECTION
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     let bookingContext = "";
 
     if (bookingFlow.intent && bookingFlow.stage === "GATHERING_DATA") {
@@ -780,26 +810,24 @@ CRITICAL: Your reply must naturally ask for the next field (${bookingFlow.next_q
 Suggested phrasing: "${bookingFlow.suggested_reply}"
 You may adapt the phrasing to sound natural in context, but MUST ask only for this one field.
 Do NOT confirm the booking yet. Do NOT mention payment yet. Just gather the next piece of info conversationally.
+Do NOT ask again for any field already listed in "collected so far".
 Keep the warm, friendly tone of the property.`;
     } else if (bookingFlow.intent && bookingFlow.stage === "READY_TO_HOLD") {
       const total = bookingFlow.total_amount;
       const nights = bookingFlow.nights;
-      const roomLabel = bookingFlow.data.room_type
-        ? formatRoomLabel(bookingFlow.data.room_type)
-        : "the room";
       bookingContext = `
 
 BOOKING FLOW ACTIVE — READY TO HOLD:
 The guest has provided all booking details. Total: $${total} USD for ${nights} nights.
-Room type (for display): ${roomLabel}
 
 CRITICAL: Your reply should:
-1. Briefly summarize the booking (name, dates, room type as "${roomLabel}", guests, total)
-2. Say you are checking availability right now (it will be confirmed in seconds by the system)
-3. Do NOT promise payment options yet — the system will handle that next
-4. Keep it warm and natural, 3-4 lines max.
+1. Briefly summarize the booking (name, dates, room type, guests, total)
+2. Say you are confirming the dates right now (the system will verify availability in seconds)
+3. Do NOT say "you've secured the dates" yet — say "I'm confirming the dates"
+4. Do NOT mention payment options yet — the system will handle that next
+5. Keep it warm and natural, 3-4 lines max.
 
-Example tone: "Perfecto Juan, déjame confirmar disponibilidad para la ${roomLabel} del 15 al 18 de junio (${nights} noches, $${total} USD para 2 personas). Un segundo..."`;
+Example tone: "Perfecto Juan, déjame confirmar la disponibilidad para la Garden Room del 15 al 18 de junio (3 noches, $270 USD para 2 personas). Un segundo..."`;
     }
 
     const fullSystemPrompt = conversationSummary
