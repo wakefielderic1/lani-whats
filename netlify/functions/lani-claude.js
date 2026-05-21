@@ -429,6 +429,134 @@ function detectMissingFields(bookingData) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// FASE 3.5 — SISTEMA DE UPSELLS / ADD-ONS
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Parsea el catálogo de upsells (JSON desde Properties sheet columna U).
+ * Si el JSON es inválido o vacío, retorna array vacío (sin crash).
+ */
+function parseUpsellsCatalog(upsellsRaw) {
+  if (!upsellsRaw) return [];
+  if (Array.isArray(upsellsRaw)) return upsellsRaw;
+  if (typeof upsellsRaw !== "string") return [];
+
+  const trimmed = upsellsRaw.trim();
+  if (!trimmed.startsWith("[")) {
+    // No es JSON — formato viejo en texto natural, ignorar
+    console.warn("[LANI] upsells column is not JSON, ignoring");
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (!Array.isArray(parsed)) return [];
+    // Validar que cada item tenga name, price, type
+    return parsed.filter(item =>
+      item &&
+      typeof item.name === "string" &&
+      typeof item.price === "number" &&
+      typeof item.type === "string"
+    );
+  } catch (e) {
+    console.warn("[LANI] failed to parse upsells JSON:", e.message);
+    return [];
+  }
+}
+
+/**
+ * Calcula el subtotal de UN add-on individual según su tipo de cobro.
+ * - flat: precio fijo, una sola vez
+ * - per_person: precio × cantidad de huéspedes
+ * - per_person_per_night: precio × huéspedes × noches
+ * - per_hour: precio × horas (default 1 si no se especifica)
+ */
+function calculateAddOnSubtotal(addOn, guestsCount, nights) {
+  if (!addOn || typeof addOn.price !== "number") return 0;
+
+  const guests = guestsCount || 1;
+  const n = nights || 1;
+  const qty = addOn.quantity || 1;
+
+  switch (addOn.type) {
+    case "flat":
+      return addOn.price * qty;
+    case "per_person":
+      return addOn.price * guests * qty;
+    case "per_person_per_night":
+      return addOn.price * guests * n;
+    case "per_hour":
+      return addOn.price * (addOn.hours || 1);
+    default:
+      return addOn.price * qty;
+  }
+}
+
+/**
+ * Match un add-on por nombre (case-insensitive, normalizado).
+ * Sirve para emparejar lo que LANI extrae de la conversación con el catálogo.
+ */
+function findAddOnInCatalog(name, catalog) {
+  if (!name || !Array.isArray(catalog)) return null;
+  const normalized = name.toLowerCase().replace(/\s+/g, " ").trim();
+  return catalog.find(item => {
+    const itemNorm = item.name.toLowerCase().replace(/\s+/g, " ").trim();
+    return itemNorm === normalized || itemNorm.includes(normalized) || normalized.includes(itemNorm);
+  }) || null;
+}
+
+/**
+ * Enriquece add_ons crudos (del extractor) con datos del catálogo
+ * (price + type). Retorna array de add_ons con subtotal calculado.
+ * Si un add_on no está en el catálogo, lo descarta.
+ */
+function enrichAddOns(rawAddOns, upsellsCatalog, guestsCount, nights) {
+  if (!Array.isArray(rawAddOns) || rawAddOns.length === 0) return [];
+
+  return rawAddOns.map(raw => {
+    const catalogEntry = findAddOnInCatalog(raw.name, upsellsCatalog);
+    if (!catalogEntry) return null;
+
+    const enriched = {
+      name: catalogEntry.name,
+      price: catalogEntry.price,
+      type: catalogEntry.type,
+      quantity: raw.quantity || 1,
+      hours: raw.hours || null
+    };
+    enriched.subtotal = calculateAddOnSubtotal(enriched, guestsCount, nights);
+    return enriched;
+  }).filter(Boolean);
+}
+
+/**
+ * Suma total de add-ons.
+ */
+function sumAddOns(addOns) {
+  if (!Array.isArray(addOns)) return 0;
+  return addOns.reduce((acc, a) => acc + (a.subtotal || 0), 0);
+}
+
+/**
+ * Formatea un add-on para mostrar al guest en el desglose.
+ */
+function formatAddOnLine(addOn, currency) {
+  const cur = currency || "USD";
+  switch (addOn.type) {
+    case "flat":
+      return `${addOn.name}: ${cur} ${addOn.subtotal.toLocaleString()}`;
+    case "per_person":
+      return `${addOn.name} × ${addOn.quantity || "guests"}: ${cur} ${addOn.subtotal.toLocaleString()}`;
+    case "per_person_per_night":
+      return `${addOn.name}: ${cur} ${addOn.subtotal.toLocaleString()}`;
+    case "per_hour":
+      return `${addOn.name} × ${addOn.hours || 1}h: ${cur} ${addOn.subtotal.toLocaleString()}`;
+    default:
+      return `${addOn.name}: ${cur} ${addOn.subtotal.toLocaleString()}`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // FIX BUG A — RECUPERACIÓN DE DATOS DESDE HISTORIAL
 // Si el extractor pone null a un campo, intentamos rescatarlo
 // del historial buscando confirmaciones previas de LANI
@@ -496,12 +624,20 @@ async function extractBookingData({
   previousMessages,
   activeBooking,
   roomRates,
-  propertyName
+  propertyName,
+  upsellsCatalog,
+  currency
 }) {
   const todayISO = getTodayISO();
+  const cur = currency || "USD";
   const ratesText = roomRates && Object.keys(roomRates).length > 0
-    ? Object.entries(roomRates).map(([k, v]) => `- ${k}: $${v}/night USD`).join("\n")
+    ? Object.entries(roomRates).map(([k, v]) => `- ${k}: ${cur} ${v}/night`).join("\n")
     : "(no room rates configured)";
+
+  const catalog = Array.isArray(upsellsCatalog) ? upsellsCatalog : [];
+  const upsellsText = catalog.length > 0
+    ? catalog.map(u => `- "${u.name}" (${cur} ${u.price}, type: ${u.type})`).join("\n")
+    : "(no upsells available for this property)";
 
   const reconstructedBooking = { ...(activeBooking || {}) };
 
@@ -589,29 +725,51 @@ CRITICAL EXTRACTION RULES:
    - guest_name (string, full name)
    - guest_email (string, valid email)
    - guest_phone (string, phone number)
+   - add_ons (array of confirmed upsells — see rules below)
 
-6. DATE PARSING:
+6. ⚠️ ADD-ONS / UPSELLS EXTRACTION:
+
+AVAILABLE UPSELLS FOR THIS PROPERTY:
+${upsellsText}
+
+   Rules for add_ons array:
+   - ONLY include an upsell if the guest EXPLICITLY confirms wanting it.
+     Examples of explicit confirmation:
+     * "Sí, agrégame el airport transfer"
+     * "Yes, add the island hopping tour"
+     * "Resérvame el transfer también"
+     * "Quiero el surf lesson"
+   - DO NOT include an upsell just because LANI mentioned it or the guest asked about it.
+     * "¿Cuánto cuesta el transfer?" → DO NOT add (just asking, not confirming)
+     * LANI: "Tenemos transfer por $30" + guest: "ok" → ambiguous, DO NOT add
+   - Use the EXACT name from the catalog (case-sensitive match preferred).
+   - For per_person items, leave quantity null (system will calculate from guests_count).
+   - For per_hour items, ask the guest for hours if not specified, otherwise null.
+   - If guest cancels an add-on ("ya no quiero el transfer"), remove it from the array.
+   - ACCUMULATE add_ons across turns just like other fields.
+
+7. DATE PARSING:
    - "del 15 al 18 de junio" with today being ${todayISO} → 
      check_in: nearest future June 15, check_out: nearest future June 18
    - "next weekend", "este fin de semana", "mañana", "tomorrow" → 
      calculate from ${todayISO}
    - If only one date given → fill check_in, leave check_out null
 
-7. ROOM TYPE MATCHING (be flexible):
+8. ROOM TYPE MATCHING (be flexible):
    - "garden", "la garden", "the garden one", "garden room por fa" → 
      room_type: "garden_room"
    - "ocean view", "vista al mar", "con vista" → "ocean_view"
-   - "villa", "private villa", "la villa" → "villa"
+   - "villa", "private villa", "la villa" → "private_villa"
    - If guest asks for a type NOT in available rates → set room_type 
      to null and note in extraction_notes
 
-8. CONFIDENCE:
+9. CONFIDENCE:
    - Only fill fields you are CONFIDENT about
    - If unclear ("como 4 o 5 personas"), pick the higher number and 
      note it in extraction_notes
    - NEVER invent emails, phones, or names
 
-9. INPUT VALIDATION:
+10. INPUT VALIDATION:
    - guest_email: must look like email (has @ and a dot)
    - guest_phone: must have digits (8+ characters typically)
    - guests_count: must be a positive integer 1-20
@@ -629,7 +787,8 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
     "guests_count": number | null,
     "guest_name": "..." | null,
     "guest_email": "..." | null,
-    "guest_phone": "..." | null
+    "guest_phone": "..." | null,
+    "add_ons": [{"name": "...", "quantity": number | null, "hours": number | null}] | []
   },
   "extraction_notes": "..." | null
 }`;
@@ -656,12 +815,23 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
 
     const extracted = JSON.parse(text);
 
-    // Merge inicial
+    // Merge inicial — campos escalares
     const mergedData = { ...reconstructedBooking };
     for (const [key, value] of Object.entries(extracted.data || {})) {
+      // add_ons es array, no escalar; lo manejamos aparte
+      if (key === "add_ons") continue;
       if (value !== null && value !== undefined && value !== "") {
         mergedData[key] = value;
       }
+    }
+
+    // add_ons: el extractor lo devuelve como source of truth en cada turno
+    // (porque mantiene historia completa de la conversación). Si devuelve [], 
+    // significa "ningún add_on confirmado" — no preservamos del estado previo.
+    if (Array.isArray(extracted.data?.add_ons)) {
+      mergedData.add_ons = extracted.data.add_ons;
+    } else if (!mergedData.add_ons) {
+      mergedData.add_ons = [];
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -799,7 +969,7 @@ function validateReadyToHold(bookingData, roomRates) {
 // Cuando READY_TO_HOLD es válido, generamos el objeto estructurado
 // que Make va a usar para crear el HOLD en Calendar + Bookings sheet.
 // ═══════════════════════════════════════════════════════════════════
-function buildBookingDataPayload(bookingData, roomRates, nights, language) {
+function buildBookingDataPayload(bookingData, roomRates, nights, language, upsellsCatalog, currency) {
   // Normalizar room_type — buscar la clave en roomRates con varias variantes
   // para ser robusto a cómo viene la data desde Properties sheet via Make.
   const roomTypeRaw = bookingData.room_type || "";
@@ -831,13 +1001,16 @@ function buildBookingDataPayload(bookingData, roomRates, nights, language) {
     .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
     .join(" ");
 
-  // FIX BUG total_amount: usar el valor ya calculado en bookingData.total_amount
-  // como fallback si el cálculo aquí falla (defensa en profundidad).
-  const subtotal = (pricePerNight && nights)
+  const roomsSubtotal = (pricePerNight && nights)
     ? pricePerNight * nights
-    : (bookingData.total_amount || 0);
+    : 0;
 
-  const totalAmount = bookingData.total_amount || subtotal;
+  // ─── FASE 3.5: Procesar add_ons ───
+  const rawAddOns = Array.isArray(bookingData.add_ons) ? bookingData.add_ons : [];
+  const enrichedAddOns = enrichAddOns(rawAddOns, upsellsCatalog || [], bookingData.guests_count, nights);
+  const addOnsTotal = sumAddOns(enrichedAddOns);
+
+  const totalAmount = roomsSubtotal + addOnsTotal;
 
   return {
     guest_name: bookingData.guest_name,
@@ -852,10 +1025,14 @@ function buildBookingDataPayload(bookingData, roomRates, nights, language) {
         room_type: roomDisplay,
         room_key: roomKey,
         price_per_night: pricePerNight || 0,
-        subtotal: subtotal
+        subtotal: roomsSubtotal
       }
     ],
+    add_ons: enrichedAddOns,
+    rooms_subtotal: roomsSubtotal,
+    add_ons_subtotal: addOnsTotal,
     total_amount: totalAmount,
+    currency: currency || "USD",
     language: language
   };
 }
@@ -864,12 +1041,19 @@ function buildBookingFlowResponse({
   bookingData,
   intent,
   roomRates,
-  language
+  language,
+  upsellsCatalog,
+  currency
 }) {
   const nights = calculateNights(bookingData.check_in, bookingData.check_out);
   if (nights) bookingData.nights = nights;
 
-  const total = calculateTotal(bookingData.room_type, nights, roomRates);
+  // Cálculo de total con add-ons incluidos
+  const roomTotal = calculateTotal(bookingData.room_type, nights, roomRates) || 0;
+  const rawAddOns = Array.isArray(bookingData.add_ons) ? bookingData.add_ons : [];
+  const enrichedAddOns = enrichAddOns(rawAddOns, upsellsCatalog || [], bookingData.guests_count, nights);
+  const addOnsTotal = sumAddOns(enrichedAddOns);
+  const total = roomTotal + addOnsTotal;
   if (total) bookingData.total_amount = total;
 
   const missing = detectMissingFields(bookingData);
@@ -877,28 +1061,23 @@ function buildBookingFlowResponse({
   let stage;
   let nextQuestion = null;
   let suggestedReply = null;
-  let bookingDataPayload = null;   // ← FASE 3: nuevo campo
-  let validationErrors = null;      // ← FASE 3: nuevo campo para debug
+  let bookingDataPayload = null;
+  let validationErrors = null;
 
   if (!intent) {
     stage = "NONE";
   } else if (missing.length === 0) {
-    // ─────────────────────────────────────────────────────────────
-    // FASE 3 — Antes de declarar READY_TO_HOLD, validar estrictamente
-    // ─────────────────────────────────────────────────────────────
     const validation = validateReadyToHold(bookingData, roomRates);
 
     if (validation.valid) {
       stage = "READY_TO_HOLD";
-      bookingDataPayload = buildBookingDataPayload(bookingData, roomRates, nights, language);
+      bookingDataPayload = buildBookingDataPayload(
+        bookingData, roomRates, nights, language, upsellsCatalog, currency
+      );
     } else {
-      // Si hay error de validación, no declarar READY_TO_HOLD.
-      // Volver a GATHERING_DATA con el primer campo problemático.
       console.warn("[LANI] READY_TO_HOLD validation failed:", validation.errors);
       stage = "GATHERING_DATA";
       validationErrors = validation.errors;
-      // El primer campo missing real (ya están todos llenos), así que
-      // pedimos confirmación general en lugar de un campo específico.
       nextQuestion = "confirmation";
       suggestedReply = language === "es"
         ? "¿Me confirmas los datos de tu reserva antes de apartarla?"
@@ -911,8 +1090,9 @@ function buildBookingFlowResponse({
     suggestedReply = questions[nextQuestion];
 
     if (nextQuestion === "room_type" && roomRates && Object.keys(roomRates).length > 0) {
+      const cur = currency || "USD";
       const roomList = Object.entries(roomRates)
-        .map(([k, v]) => `- ${k.charAt(0).toUpperCase() + k.slice(1)}: $${v} USD/noche`)
+        .map(([k, v]) => `- ${k.charAt(0).toUpperCase() + k.slice(1)}: ${cur} ${v}/noche`)
         .join("\n");
       suggestedReply = language === "es"
         ? `${suggestedReply}\n\nTenemos disponibles:\n${roomList}`
@@ -929,10 +1109,10 @@ function buildBookingFlowResponse({
     suggested_reply: suggestedReply,
     total_amount: bookingData.total_amount || null,
     nights: bookingData.nights || null,
-    // ─── FASE 3 — Campos nuevos ─────────────────────────────────
-    booking_data: bookingDataPayload,        // estructurado para Make (null si no READY_TO_HOLD)
-    language: language,                       // detectado de la conversación
-    validation_errors: validationErrors       // null si todo bien, array si falló validación
+    booking_data: bookingDataPayload,
+    language: language,
+    currency: currency || "USD",
+    validation_errors: validationErrors
   };
 }
 
@@ -946,7 +1126,7 @@ exports.handler = async (event) => {
 
   try {
     let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw;
-    let activeBookingRaw, roomRatesRaw, propertyName;
+    let activeBookingRaw, roomRatesRaw, propertyName, upsellsRaw, currency;
 
     const contentType = event.headers["content-type"] || "";
 
@@ -961,6 +1141,8 @@ exports.handler = async (event) => {
       activeBookingRaw  = params.get("activeBooking") || "{}";
       roomRatesRaw      = params.get("roomRates") || "{}";
       propertyName      = params.get("propertyName") || "";
+      upsellsRaw        = params.get("upsells") || "";
+      currency          = params.get("currency") || "USD";
     } else {
       const body = JSON.parse(event.body);
       systemPrompt      = body.systemPrompt || "";
@@ -972,6 +1154,8 @@ exports.handler = async (event) => {
       activeBookingRaw  = body.activeBooking || "{}";
       roomRatesRaw      = body.roomRates || "{}";
       propertyName      = body.propertyName || "";
+      upsellsRaw        = body.upsells || "";
+      currency          = body.currency || "USD";
     }
 
     if (!userMessage) {
@@ -992,6 +1176,9 @@ exports.handler = async (event) => {
     let roomRates = {};
     try { roomRates = typeof roomRatesRaw === 'string' ? JSON.parse(roomRatesRaw) : roomRatesRaw; } catch (e) { roomRates = {}; }
     if (!roomRates || typeof roomRates !== 'object') roomRates = {};
+
+    // ─── FASE 3.5: Catálogo de upsells ───
+    const upsellsCatalog = parseUpsellsCatalog(upsellsRaw);
 
     // ─────────────────────────────────────────────────────────────
     // MODO IDENTIFICACIÓN — no hay propertyId aún
@@ -1173,14 +1360,18 @@ exports.handler = async (event) => {
         previousMessages,
         activeBooking,
         roomRates,
-        propertyName: propertyName || "this property"
+        propertyName: propertyName || "this property",
+        upsellsCatalog,
+        currency
       });
 
       bookingFlow = buildBookingFlowResponse({
         bookingData: extraction.data,
         intent: extraction.intent,
         roomRates,
-        language
+        language,
+        upsellsCatalog,
+        currency
       });
 
       bookingFlow.extraction_notes = extraction.extraction_notes;
@@ -1221,22 +1412,29 @@ Keep the warm, friendly tone of the property.`;
     } else if (bookingFlow.intent && bookingFlow.stage === "READY_TO_HOLD") {
       const total = bookingFlow.total_amount;
       const nights = bookingFlow.nights;
+      const cur = bookingFlow.currency || currency || "USD";
+
+      // Desglose de add-ons si hay
+      const bd = bookingFlow.booking_data || {};
+      const addOns = Array.isArray(bd.add_ons) ? bd.add_ons : [];
+      const addOnsBlock = addOns.length > 0
+        ? `\n\nExtras included:\n${addOns.map(a => `- ${a.name}: ${cur} ${a.subtotal.toLocaleString()}`).join("\n")}`
+        : "";
+
       bookingContext = `
 
 BOOKING FLOW ACTIVE — READY TO HOLD:
-The guest has provided all booking details. Total: $${total} USD for ${nights} nights.
+The guest has provided all booking details. Total: ${cur} ${total ? total.toLocaleString() : "?"} for ${nights} nights.${addOnsBlock}
 
 CRITICAL: Your reply should:
-1. Briefly summarize the booking (name, dates, room type, guests, total)
-2. Say you are checking availability right now (the system will verify in seconds)
-3. Mention they will have 30 minutes to complete payment to lock the booking once availability is confirmed
-4. Do NOT say "you've secured the dates" yet — say "I'm checking availability" or "placing a hold"
-5. Do NOT include a payment link — the system will send it next
-6. Keep it warm and natural, 3-5 lines max.
-
-Example tone (Spanish): "Perfecto Juan 🌴 Te voy a apartar la Garden Room del 15 al 18 de junio (3 noches, $270 USD para 2 personas). Estoy confirmando disponibilidad — en cuanto la confirme te paso el link de pago, y vas a tener 30 minutos para completarlo y dejar la reserva lista."
-
-Example tone (English): "Perfect Juan 🌴 Placing a hold for Garden Room June 15–18 (3 nights, $270 USD for 2 guests). I'm confirming availability now — once confirmed I'll send the payment link, and you'll have 30 minutes to complete it to lock the booking in."`;
+1. Briefly summarize the booking (name, dates, room type, guests, total ${cur})
+2. If there are extras, mention them in the summary
+3. Say you are checking availability right now (the system will verify in seconds)
+4. Mention they will have 30 minutes to complete payment to lock the booking once availability is confirmed
+5. Do NOT say "you've secured the dates" yet — say "I'm checking availability" or "placing a hold"
+6. Do NOT include a payment link — the system will send it next
+7. Keep it warm and natural, 3-5 lines max.
+8. ALWAYS use the currency code ${cur}, never "$" alone or "USD" if currency is different.`;
     }
 
     const fullSystemPrompt = conversationSummary
