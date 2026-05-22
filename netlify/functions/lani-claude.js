@@ -1,7 +1,57 @@
+// ═══════════════════════════════════════════════════════════════════
+// LANI CLAUDE BACKEND — v6 (con Stripe Checkout integration)
+// Cambios vs v5:
+//   1. Import de Stripe SDK + lazy init
+//   2. Nueva función createStripeCheckoutSession() con line_items por
+//      habitación y add-ons separados, currency dinámica, fallback
+//      resiliente (try/catch — si Stripe falla, booking sigue sin link)
+//   3. Llamada a Stripe en buildBookingFlowResponse cuando stage===READY_TO_HOLD
+//      → agrega checkout_url al payload de respuesta para que Make lo use
+// ═══════════════════════════════════════════════════════════════════
+
 const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
 const MAX_HISTORY = 20;
 const SUMMARY_THRESHOLD = 10;
 const TIMEOUT_MS = 20000;
+
+// ─── STRIPE CONFIG ───
+// Lazy-init: solo se inicializa Stripe si STRIPE_SECRET_KEY existe.
+// Esto evita crashes al deployar si la env var aún no está configurada.
+let stripeClient = null;
+function getStripeClient() {
+  if (stripeClient) return stripeClient;
+  if (!process.env.STRIPE_SECRET_KEY) {
+    console.warn("[LANI] STRIPE_SECRET_KEY not set, Stripe disabled");
+    return null;
+  }
+  try {
+    const Stripe = require("stripe");
+    stripeClient = Stripe(process.env.STRIPE_SECRET_KEY, {
+      apiVersion: "2026-04-22.dahlia",
+      timeout: 8000, // 8s timeout para no bloquear el flujo
+      maxNetworkRetries: 1
+    });
+    return stripeClient;
+  } catch (err) {
+    console.error("[LANI] Failed to init Stripe:", err.message);
+    return null;
+  }
+}
+
+// Currencies de cero decimales (Stripe espera el monto sin multiplicar por 100).
+// Ref: https://docs.stripe.com/currencies#zero-decimal
+const ZERO_DECIMAL_CURRENCIES = new Set([
+  "BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW", "MGA",
+  "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF"
+]);
+
+function toStripeAmount(amount, currency) {
+  const cur = (currency || "USD").toUpperCase();
+  if (ZERO_DECIMAL_CURRENCIES.has(cur)) {
+    return Math.round(amount);
+  }
+  return Math.round(amount * 100);
+}
 
 const ESCALATION_KEYWORDS = [
   "emergency", "urgente", "urgent", "problema grave", "accidente",
@@ -116,8 +166,6 @@ No explanation. No punctuation. No other text.`;
 
 // ═══════════════════════════════════════════════════════════════════
 // FIX BUG C — CLASIFICAR INTENCIÓN DE MENSAJES SIN PROPIEDAD
-// Detecta si el guest está intentando identificar propiedad o
-// si está haciendo otra cosa (preguntando, atacando, saludando)
 // ═══════════════════════════════════════════════════════════════════
 async function classifyPreIdentificationMessage(userMessage) {
   const prompt = `You are classifying a guest's first message in a hotel chat system. The guest has not yet chosen which property they want to contact.
@@ -194,8 +242,6 @@ No explanation. No punctuation. Just the category.`;
 
 // ─────────────────────────────────────────────────────────────────
 // RESPUESTAS RÁPIDAS PARA PRE-IDENTIFICATION
-// Cuando el guest hace algo que NO es identificar propiedad,
-// respondemos según categoría y luego pedimos que elija propiedad
 // ─────────────────────────────────────────────────────────────────
 function getPreIdentificationResponse(category, propertiesList) {
   const { optionsText } = buildSelectionMessage(propertiesList, null);
@@ -390,11 +436,9 @@ function calculateNights(checkIn, checkOut) {
 function calculateTotal(roomType, nights, roomRates) {
   if (!roomType || !nights || !roomRates) return null;
 
-  // Normalizar el roomType a varias variantes para máxima robustez
   const roomTypeRaw = roomType;
   const roomKey = roomTypeRaw.toLowerCase().replace(/\s+/g, "_");
 
-  // Intentar varias variantes
   let rate =
     roomRates[roomKey] ||
     roomRates[roomTypeRaw] ||
@@ -402,7 +446,6 @@ function calculateTotal(roomType, nights, roomRates) {
     roomRates[roomTypeRaw.replace(/_/g, " ")] ||
     null;
 
-  // Si aún no encontramos, hacer match case-insensitive normalizado
   if (!rate && Object.keys(roomRates).length > 0) {
     for (const [k, v] of Object.entries(roomRates)) {
       const normalizedKey = k.toLowerCase().replace(/\s+/g, "_");
@@ -432,10 +475,6 @@ function detectMissingFields(bookingData) {
 // FASE 3.5 — SISTEMA DE UPSELLS / ADD-ONS
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Parsea el catálogo de upsells (JSON desde Properties sheet columna U).
- * Si el JSON es inválido o vacío, retorna array vacío (sin crash).
- */
 function parseUpsellsCatalog(upsellsRaw) {
   if (!upsellsRaw) return [];
   if (Array.isArray(upsellsRaw)) return upsellsRaw;
@@ -443,7 +482,6 @@ function parseUpsellsCatalog(upsellsRaw) {
 
   const trimmed = upsellsRaw.trim();
   if (!trimmed.startsWith("[")) {
-    // No es JSON — formato viejo en texto natural, ignorar
     console.warn("[LANI] upsells column is not JSON, ignoring");
     return [];
   }
@@ -451,7 +489,6 @@ function parseUpsellsCatalog(upsellsRaw) {
   try {
     const parsed = JSON.parse(trimmed);
     if (!Array.isArray(parsed)) return [];
-    // Validar que cada item tenga name, price, type
     return parsed.filter(item =>
       item &&
       typeof item.name === "string" &&
@@ -464,13 +501,6 @@ function parseUpsellsCatalog(upsellsRaw) {
   }
 }
 
-/**
- * Calcula el subtotal de UN add-on individual según su tipo de cobro.
- * - flat: precio fijo, una sola vez
- * - per_person: precio × cantidad de huéspedes
- * - per_person_per_night: precio × huéspedes × noches
- * - per_hour: precio × horas (default 1 si no se especifica)
- */
 function calculateAddOnSubtotal(addOn, guestsCount, nights) {
   if (!addOn || typeof addOn.price !== "number") return 0;
 
@@ -492,10 +522,6 @@ function calculateAddOnSubtotal(addOn, guestsCount, nights) {
   }
 }
 
-/**
- * Match un add-on por nombre (case-insensitive, normalizado).
- * Sirve para emparejar lo que LANI extrae de la conversación con el catálogo.
- */
 function findAddOnInCatalog(name, catalog) {
   if (!name || !Array.isArray(catalog)) return null;
   const normalized = name.toLowerCase().replace(/\s+/g, " ").trim();
@@ -505,11 +531,6 @@ function findAddOnInCatalog(name, catalog) {
   }) || null;
 }
 
-/**
- * Enriquece add_ons crudos (del extractor) con datos del catálogo
- * (price + type). Retorna array de add_ons con subtotal calculado.
- * Si un add_on no está en el catálogo, lo descarta.
- */
 function enrichAddOns(rawAddOns, upsellsCatalog, guestsCount, nights) {
   if (!Array.isArray(rawAddOns) || rawAddOns.length === 0) return [];
 
@@ -529,17 +550,11 @@ function enrichAddOns(rawAddOns, upsellsCatalog, guestsCount, nights) {
   }).filter(Boolean);
 }
 
-/**
- * Suma total de add-ons.
- */
 function sumAddOns(addOns) {
   if (!Array.isArray(addOns)) return 0;
   return addOns.reduce((acc, a) => acc + (a.subtotal || 0), 0);
 }
 
-/**
- * Formatea un add-on para mostrar al guest en el desglose.
- */
 function formatAddOnLine(addOn, currency) {
   const cur = currency || "USD";
   switch (addOn.type) {
@@ -558,13 +573,10 @@ function formatAddOnLine(addOn, currency) {
 
 // ═══════════════════════════════════════════════════════════════════
 // FIX BUG A — RECUPERACIÓN DE DATOS DESDE HISTORIAL
-// Si el extractor pone null a un campo, intentamos rescatarlo
-// del historial buscando confirmaciones previas de LANI
 // ═══════════════════════════════════════════════════════════════════
 function recoverFieldFromHistory(field, previousMessages) {
   if (!previousMessages || previousMessages.length === 0) return null;
 
-  // Combinar todos los mensajes del assistant en un solo texto
   const assistantText = previousMessages
     .filter(m => m.role === "assistant")
     .map(m => m.content)
@@ -577,10 +589,8 @@ function recoverFieldFromHistory(field, previousMessages) {
 
   const allText = `${assistantText}\n${userText}`;
 
-  // Patrones de búsqueda por tipo de campo
   switch (field) {
     case "guest_name": {
-      // LANI dice "Perfecto Daniel" / "Listo Daniel" / "te anoto Daniel..."
       const patterns = [
         /(?:Perfecto|Listo|Anotado|Hola|Hi|Gracias)[, ]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)+)/g,
         /(?:tu nombre|name).+?([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)/g
@@ -588,7 +598,7 @@ function recoverFieldFromHistory(field, previousMessages) {
       for (const pattern of patterns) {
         const matches = [...allText.matchAll(pattern)];
         if (matches.length > 0) {
-          return matches[matches.length - 1][1]; // último match
+          return matches[matches.length - 1][1];
         }
       }
       break;
@@ -602,9 +612,8 @@ function recoverFieldFromHistory(field, previousMessages) {
     }
 
     case "guest_phone": {
-      // Números de 8+ dígitos consecutivos
       const phonePattern = /\b\d{8,15}\b/g;
-      const matches = userText.match(phonePattern); // solo del user, no de LANI
+      const matches = userText.match(phonePattern);
       if (matches && matches.length > 0) return matches[matches.length - 1];
       break;
     }
@@ -614,10 +623,7 @@ function recoverFieldFromHistory(field, previousMessages) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// FIX BUG A — extractBookingData v3
-// Cambios vs v2:
-// 1. Reglas más fuertes sobre correcciones (nunca resetear campos)
-// 2. Safety net post-extracción: recuperar campos faltantes del historial
+// extractBookingData v3
 // ═══════════════════════════════════════════════════════════════════
 async function extractBookingData({
   userMessage,
@@ -815,29 +821,20 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
 
     const extracted = JSON.parse(text);
 
-    // Merge inicial — campos escalares
     const mergedData = { ...reconstructedBooking };
     for (const [key, value] of Object.entries(extracted.data || {})) {
-      // add_ons es array, no escalar; lo manejamos aparte
       if (key === "add_ons") continue;
       if (value !== null && value !== undefined && value !== "") {
         mergedData[key] = value;
       }
     }
 
-    // add_ons: el extractor lo devuelve como source of truth en cada turno
-    // (porque mantiene historia completa de la conversación). Si devuelve [], 
-    // significa "ningún add_on confirmado" — no preservamos del estado previo.
     if (Array.isArray(extracted.data?.add_ons)) {
       mergedData.add_ons = extracted.data.add_ons;
     } else if (!mergedData.add_ons) {
       mergedData.add_ons = [];
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // SAFETY NET — Fix Bug A
-    // Si algún campo quedó vacío, intentar recuperarlo del historial
-    // ─────────────────────────────────────────────────────────────
     const recoverableFields = ["guest_name", "guest_email", "guest_phone"];
     for (const field of recoverableFields) {
       if (!mergedData[field]) {
@@ -871,13 +868,10 @@ function detectLanguage(text) {
 
 // ═══════════════════════════════════════════════════════════════════
 // FASE 3 — VALIDACIÓN ESTRICTA DE READY_TO_HOLD
-// Antes de declarar READY_TO_HOLD, verificamos que TODOS los datos
-// estén bien formateados. Si algo falla, downgrade a GATHERING_DATA.
 // ═══════════════════════════════════════════════════════════════════
 function validateReadyToHold(bookingData, roomRates) {
   const errors = [];
 
-  // 1. Campos requeridos presentes
   if (!bookingData.room_type) errors.push("room_type missing");
   if (!bookingData.check_in) errors.push("check_in missing");
   if (!bookingData.check_out) errors.push("check_out missing");
@@ -886,7 +880,6 @@ function validateReadyToHold(bookingData, roomRates) {
   if (!bookingData.guest_email) errors.push("guest_email missing");
   if (!bookingData.guest_phone) errors.push("guest_phone missing");
 
-  // 2. Formato de fechas YYYY-MM-DD
   const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
   if (bookingData.check_in && !dateRegex.test(bookingData.check_in)) {
     errors.push("check_in format invalid");
@@ -895,7 +888,6 @@ function validateReadyToHold(bookingData, roomRates) {
     errors.push("check_out format invalid");
   }
 
-  // 3. check_out estrictamente después de check_in
   if (bookingData.check_in && bookingData.check_out) {
     const inDate = new Date(bookingData.check_in);
     const outDate = new Date(bookingData.check_out);
@@ -906,7 +898,6 @@ function validateReadyToHold(bookingData, roomRates) {
     }
   }
 
-  // 4. check_in no en el pasado (con tolerancia de 1 día por zonas horarias)
   if (bookingData.check_in && dateRegex.test(bookingData.check_in)) {
     const inDate = new Date(bookingData.check_in);
     const yesterday = new Date();
@@ -916,19 +907,16 @@ function validateReadyToHold(bookingData, roomRates) {
     }
   }
 
-  // 5. Email con formato razonable
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (bookingData.guest_email && !emailRegex.test(bookingData.guest_email)) {
     errors.push("guest_email format invalid");
   }
 
-  // 6. Teléfono con al menos 8 dígitos
   if (bookingData.guest_phone) {
     const phoneDigits = String(bookingData.guest_phone).replace(/\D/g, "");
     if (phoneDigits.length < 8) errors.push("guest_phone too short");
   }
 
-  // 7. Room type existe en rates
   if (bookingData.room_type && roomRates && Object.keys(roomRates).length > 0) {
     const roomTypeRaw = bookingData.room_type;
     const roomKey = roomTypeRaw.toLowerCase().replace(/\s+/g, "_");
@@ -953,7 +941,6 @@ function validateReadyToHold(bookingData, roomRates) {
     if (!rate) errors.push(`room_type "${bookingData.room_type}" not in rates`);
   }
 
-  // 8. guests_count razonable
   if (bookingData.guests_count && (bookingData.guests_count < 1 || bookingData.guests_count > 50)) {
     errors.push("guests_count out of reasonable range");
   }
@@ -966,16 +953,11 @@ function validateReadyToHold(bookingData, roomRates) {
 
 // ═══════════════════════════════════════════════════════════════════
 // FASE 3 — CONSTRUCTOR DE booking_data PARA MAKE
-// Cuando READY_TO_HOLD es válido, generamos el objeto estructurado
-// que Make va a usar para crear el HOLD en Calendar + Bookings sheet.
 // ═══════════════════════════════════════════════════════════════════
 function buildBookingDataPayload(bookingData, roomRates, nights, language, upsellsCatalog, currency) {
-  // Normalizar room_type — buscar la clave en roomRates con varias variantes
-  // para ser robusto a cómo viene la data desde Properties sheet via Make.
   const roomTypeRaw = bookingData.room_type || "";
   const roomKey = roomTypeRaw.toLowerCase().replace(/\s+/g, "_");
 
-  // Intentar varias variantes para encontrar el precio
   let pricePerNight =
     roomRates[roomKey] ||
     roomRates[roomTypeRaw] ||
@@ -983,7 +965,6 @@ function buildBookingDataPayload(bookingData, roomRates, nights, language, upsel
     roomRates[roomTypeRaw.replace(/_/g, " ")] ||
     null;
 
-  // Si aún no encontramos, intentar match case-insensitive en las claves
   if (!pricePerNight && roomRates && Object.keys(roomRates).length > 0) {
     const normalizedTarget = roomKey;
     for (const [k, v] of Object.entries(roomRates)) {
@@ -995,7 +976,6 @@ function buildBookingDataPayload(bookingData, roomRates, nights, language, upsel
     }
   }
 
-  // Etiqueta de display del room_type (Title Case desde la clave)
   const roomDisplay = roomTypeRaw
     .split(/[_\s]+/)
     .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
@@ -1005,7 +985,6 @@ function buildBookingDataPayload(bookingData, roomRates, nights, language, upsel
     ? pricePerNight * nights
     : 0;
 
-  // ─── FASE 3.5: Procesar add_ons ───
   const rawAddOns = Array.isArray(bookingData.add_ons) ? bookingData.add_ons : [];
   const enrichedAddOns = enrichAddOns(rawAddOns, upsellsCatalog || [], bookingData.guests_count, nights);
   const addOnsTotal = sumAddOns(enrichedAddOns);
@@ -1037,18 +1016,161 @@ function buildBookingDataPayload(bookingData, roomRates, nights, language, upsel
   };
 }
 
-function buildBookingFlowResponse({
+// ═══════════════════════════════════════════════════════════════════
+// FASE 3 PARTE B — STRIPE CHECKOUT SESSION
+// Crea una Checkout Session con line_items separados:
+//   - 1 line item por habitación (con desglose noches × precio)
+//   - 1 line item por cada add-on confirmado
+// Retorna { checkout_url, session_id } o null si Stripe falla.
+// El booking debe seguir adelante aunque esto retorne null.
+// ═══════════════════════════════════════════════════════════════════
+async function createStripeCheckoutSession(bookingPayload, propertyName) {
+  const stripe = getStripeClient();
+  if (!stripe) {
+    console.warn("[LANI] Stripe client not available, skipping checkout creation");
+    return null;
+  }
+
+  const siteUrl = process.env.SITE_URL || "https://lani.ph";
+  const currency = (bookingPayload.currency || "USD").toLowerCase();
+
+  try {
+    // ─── Construir line_items ───
+    const lineItems = [];
+
+    // 1. Habitación (room)
+    const room = bookingPayload.rooms && bookingPayload.rooms[0];
+    if (room && room.subtotal > 0) {
+      const roomDescription = bookingPayload.nights && bookingPayload.guests_count
+        ? `${bookingPayload.nights} noches · ${bookingPayload.guests_count} ${bookingPayload.guests_count === 1 ? "huésped" : "huéspedes"}`
+        : "Estancia";
+
+      lineItems.push({
+        price_data: {
+          currency,
+          product_data: {
+            name: `${propertyName} — ${room.room_type}`,
+            description: roomDescription
+          },
+          unit_amount: toStripeAmount(room.subtotal, currency)
+        },
+        quantity: 1
+      });
+    }
+
+    // 2. Add-ons (uno por uno, cada uno con su nombre legible)
+    const addOns = Array.isArray(bookingPayload.add_ons) ? bookingPayload.add_ons : [];
+    for (const addOn of addOns) {
+      if (!addOn.subtotal || addOn.subtotal <= 0) continue;
+
+      // Descripción según tipo
+      let desc = "";
+      if (addOn.type === "per_person") {
+        desc = `${bookingPayload.guests_count || addOn.quantity || 1} personas`;
+      } else if (addOn.type === "per_person_per_night") {
+        desc = `${bookingPayload.guests_count || 1} personas × ${bookingPayload.nights || 1} noches`;
+      } else if (addOn.type === "per_hour") {
+        desc = `${addOn.hours || 1} hora${(addOn.hours || 1) > 1 ? "s" : ""}`;
+      } else {
+        desc = "Extra";
+      }
+
+      lineItems.push({
+        price_data: {
+          currency,
+          product_data: {
+            name: addOn.name,
+            description: desc
+          },
+          unit_amount: toStripeAmount(addOn.subtotal, currency)
+        },
+        quantity: 1
+      });
+    }
+
+    if (lineItems.length === 0) {
+      console.warn("[LANI] No line items to charge, skipping Stripe");
+      return null;
+    }
+
+    // ─── Generar booking_code temporal para el metadata + URLs ───
+    // (Make va a generar el booking_code "oficial" en Sheets 32,
+    //  pero necesitamos algo aquí para trazabilidad y para que la
+    //  página de éxito tenga un código que mostrar)
+    const tempBookingCode = `LANI-${new Date().toISOString().slice(0,10).replace(/-/g,"")}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;
+
+    // ─── Query params para success_url (página los lee y los muestra) ───
+    const successParams = new URLSearchParams({
+      session_id: "{CHECKOUT_SESSION_ID}",
+      code: tempBookingCode,
+      hotel: propertyName,
+      room: room ? room.room_type : "",
+      checkin: bookingPayload.check_in || "",
+      checkout: bookingPayload.check_out || "",
+      guests: String(bookingPayload.guests_count || ""),
+      amount: `${bookingPayload.currency} ${bookingPayload.total_amount.toLocaleString()}`
+    });
+
+    // Stripe acepta {CHECKOUT_SESSION_ID} literal en success_url, lo expande al redirect
+    const successUrl = `${siteUrl}/pago-exitoso?${successParams.toString()}`.replace(
+      encodeURIComponent("{CHECKOUT_SESSION_ID}"),
+      "{CHECKOUT_SESSION_ID}"
+    );
+    const cancelUrl = `${siteUrl}/pago-cancelado`;
+
+    // ─── Crear Checkout Session ───
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      line_items: lineItems,
+      customer_email: bookingPayload.guest_email || undefined,
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      expires_at: Math.floor(Date.now() / 1000) + 30 * 60, // 30 min HOLD
+      metadata: {
+        booking_code: tempBookingCode,
+        property_name: propertyName,
+        guest_name: bookingPayload.guest_name || "",
+        guest_phone: bookingPayload.guest_phone || "",
+        check_in: bookingPayload.check_in || "",
+        check_out: bookingPayload.check_out || "",
+        room_type: room ? room.room_type : "",
+        guests_count: String(bookingPayload.guests_count || ""),
+        nights: String(bookingPayload.nights || ""),
+        total_amount: String(bookingPayload.total_amount || ""),
+        currency: bookingPayload.currency || "USD"
+      }
+    });
+
+    console.log(`[LANI] Stripe Checkout Session created: ${session.id}`);
+
+    return {
+      checkout_url: session.url,
+      session_id: session.id,
+      temp_booking_code: tempBookingCode
+    };
+
+  } catch (err) {
+    console.error("[LANI] Stripe Checkout creation failed:", err.message);
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// buildBookingFlowResponse — ahora con integración Stripe
+// ═══════════════════════════════════════════════════════════════════
+async function buildBookingFlowResponse({
   bookingData,
   intent,
   roomRates,
   language,
   upsellsCatalog,
-  currency
+  currency,
+  propertyName
 }) {
   const nights = calculateNights(bookingData.check_in, bookingData.check_out);
   if (nights) bookingData.nights = nights;
 
-  // Cálculo de total con add-ons incluidos
   const roomTotal = calculateTotal(bookingData.room_type, nights, roomRates) || 0;
   const rawAddOns = Array.isArray(bookingData.add_ons) ? bookingData.add_ons : [];
   const enrichedAddOns = enrichAddOns(rawAddOns, upsellsCatalog || [], bookingData.guests_count, nights);
@@ -1063,6 +1185,9 @@ function buildBookingFlowResponse({
   let suggestedReply = null;
   let bookingDataPayload = null;
   let validationErrors = null;
+  let checkoutUrl = null;
+  let stripeSessionId = null;
+  let tempBookingCode = null;
 
   if (!intent) {
     stage = "NONE";
@@ -1074,6 +1199,24 @@ function buildBookingFlowResponse({
       bookingDataPayload = buildBookingDataPayload(
         bookingData, roomRates, nights, language, upsellsCatalog, currency
       );
+
+      // ─── STRIPE: crear Checkout Session ───
+      // Si falla, checkoutUrl queda null y el flujo continúa.
+      // Make puede revisar si checkout_url existe y caer a fallback.
+      try {
+        const stripeResult = await createStripeCheckoutSession(
+          bookingDataPayload,
+          propertyName || "Hotel"
+        );
+        if (stripeResult) {
+          checkoutUrl = stripeResult.checkout_url;
+          stripeSessionId = stripeResult.session_id;
+          tempBookingCode = stripeResult.temp_booking_code;
+        }
+      } catch (err) {
+        console.error("[LANI] Stripe call wrapper failed:", err.message);
+        // checkoutUrl queda null
+      }
     } else {
       console.warn("[LANI] READY_TO_HOLD validation failed:", validation.errors);
       stage = "GATHERING_DATA";
@@ -1112,7 +1255,11 @@ function buildBookingFlowResponse({
     booking_data: bookingDataPayload,
     language: language,
     currency: currency || "USD",
-    validation_errors: validationErrors
+    validation_errors: validationErrors,
+    // ─── Nuevos campos Fase 3B ───
+    checkout_url: checkoutUrl,
+    stripe_session_id: stripeSessionId,
+    temp_booking_code: tempBookingCode
   };
 }
 
@@ -1177,7 +1324,6 @@ exports.handler = async (event) => {
     try { roomRates = typeof roomRatesRaw === 'string' ? JSON.parse(roomRatesRaw) : roomRatesRaw; } catch (e) { roomRates = {}; }
     if (!roomRates || typeof roomRates !== 'object') roomRates = {};
 
-    // ─── FASE 3.5: Catálogo de upsells ───
     const upsellsCatalog = parseUpsellsCatalog(upsellsRaw);
 
     // ─────────────────────────────────────────────────────────────
@@ -1199,10 +1345,6 @@ exports.handler = async (event) => {
 
       const listToDetect = pendingFlatList || propertiesList;
 
-      // ═══════════════════════════════════════════════════════════
-      // FIX BUG C — CLASIFICAR INTENCIÓN ANTES DE DETECCIÓN
-      // Si el mensaje NO es de identificación, responder apropiadamente
-      // ═══════════════════════════════════════════════════════════
       const category = await classifyPreIdentificationMessage(userMessage);
 
       if (category !== "IDENTIFICATION") {
@@ -1225,13 +1367,12 @@ exports.handler = async (event) => {
               needsEscalation: category === "EMERGENCY",
               escalationKeyword: null,
               detectedPropertyId: null,
-              bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null }
+              bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null, checkout_url: null, stripe_session_id: null, temp_booking_code: null }
             })
           };
         }
       }
 
-      // Detección normal de propiedad
       const detected = await detectPropertyFromMessage(userMessage, listToDetect);
 
       if (detected !== "NONE" && detected !== "AMBIGUOUS" && !detected.startsWith("LOCATION_MULTIPLE")) {
@@ -1254,7 +1395,7 @@ exports.handler = async (event) => {
               needsEscalation: false,
               escalationKeyword: null,
               detectedPropertyId: detected,
-              bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null }
+              bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null, checkout_url: null, stripe_session_id: null, temp_booking_code: null }
             })
           };
         }
@@ -1280,7 +1421,7 @@ exports.handler = async (event) => {
             needsEscalation: false,
             escalationKeyword: null,
             detectedPropertyId: null,
-            bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null }
+            bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null, checkout_url: null, stripe_session_id: null, temp_booking_code: null }
           })
         };
       }
@@ -1305,7 +1446,7 @@ exports.handler = async (event) => {
           needsEscalation: false,
           escalationKeyword: null,
           detectedPropertyId: null,
-          bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null }
+          bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: "es", validation_errors: null, checkout_url: null, stripe_session_id: null, temp_booking_code: null }
         })
       };
     }
@@ -1352,7 +1493,12 @@ exports.handler = async (event) => {
     }
 
     const language = detectLanguage(userMessage);
-    let bookingFlow = { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: language, validation_errors: null };
+    let bookingFlow = {
+      intent: false, stage: "NONE", data: {}, missing_fields: [],
+      next_question: null, booking_data: null, language: language,
+      validation_errors: null, checkout_url: null, stripe_session_id: null,
+      temp_booking_code: null
+    };
 
     try {
       const extraction = await extractBookingData({
@@ -1365,13 +1511,14 @@ exports.handler = async (event) => {
         currency
       });
 
-      bookingFlow = buildBookingFlowResponse({
+      bookingFlow = await buildBookingFlowResponse({
         bookingData: extraction.data,
         intent: extraction.intent,
         roomRates,
         language,
         upsellsCatalog,
-        currency
+        currency,
+        propertyName: propertyName || "this property"
       });
 
       bookingFlow.extraction_notes = extraction.extraction_notes;
@@ -1414,7 +1561,6 @@ Keep the warm, friendly tone of the property.`;
       const nights = bookingFlow.nights;
       const cur = bookingFlow.currency || currency || "USD";
 
-      // Desglose de add-ons si hay
       const bd = bookingFlow.booking_data || {};
       const addOns = Array.isArray(bd.add_ons) ? bd.add_ons : [];
       const addOnsBlock = addOns.length > 0
