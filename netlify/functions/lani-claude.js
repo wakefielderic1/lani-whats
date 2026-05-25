@@ -1166,7 +1166,8 @@ async function buildBookingFlowResponse({
   language,
   upsellsCatalog,
   currency,
-  propertyName
+  propertyName,
+  skipStripe = false
 }) {
   const nights = calculateNights(bookingData.check_in, bookingData.check_out);
   if (nights) bookingData.nights = nights;
@@ -1201,21 +1202,25 @@ async function buildBookingFlowResponse({
       );
 
       // ─── STRIPE: crear Checkout Session ───
+      // Si skipStripe=true, se omite (primera llamada — solo reply conversacional)
       // Si falla, checkoutUrl queda null y el flujo continúa.
-      // Make puede revisar si checkout_url existe y caer a fallback.
-      try {
-        const stripeResult = await createStripeCheckoutSession(
-          bookingDataPayload,
-          propertyName || "Hotel"
-        );
-        if (stripeResult) {
-          checkoutUrl = stripeResult.checkout_url;
-          stripeSessionId = stripeResult.session_id;
-          tempBookingCode = stripeResult.temp_booking_code;
+      if (!skipStripe) {
+        try {
+          const stripeResult = await createStripeCheckoutSession(
+            bookingDataPayload,
+            propertyName || "Hotel"
+          );
+          if (stripeResult) {
+            checkoutUrl = stripeResult.checkout_url;
+            stripeSessionId = stripeResult.session_id;
+            tempBookingCode = stripeResult.temp_booking_code;
+          }
+        } catch (err) {
+          console.error("[LANI] Stripe call wrapper failed:", err.message);
+          // checkoutUrl queda null
         }
-      } catch (err) {
-        console.error("[LANI] Stripe call wrapper failed:", err.message);
-        // checkoutUrl queda null
+      } else {
+        console.log("[LANI] skipStripe=true — omitiendo Stripe Checkout Session");
       }
     } else {
       console.warn("[LANI] READY_TO_HOLD validation failed:", validation.errors);
@@ -1273,7 +1278,7 @@ exports.handler = async (event) => {
 
   try {
     let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw;
-    let activeBookingRaw, roomRatesRaw, propertyName, upsellsRaw, currency;
+    let activeBookingRaw, roomRatesRaw, propertyName, upsellsRaw, currency, skipStripe;
 
     const contentType = event.headers["content-type"] || "";
 
@@ -1290,6 +1295,7 @@ exports.handler = async (event) => {
       propertyName      = params.get("propertyName") || "";
       upsellsRaw        = params.get("upsells") || "";
       currency          = params.get("currency") || "USD";
+      skipStripe        = params.get("skipStripe") === "true";
     } else {
       const body = JSON.parse(event.body);
       systemPrompt      = body.systemPrompt || "";
@@ -1303,6 +1309,7 @@ exports.handler = async (event) => {
       propertyName      = body.propertyName || "";
       upsellsRaw        = body.upsells || "";
       currency          = body.currency || "USD";
+      skipStripe        = body.skipStripe === true;
     }
 
     if (!userMessage) {
@@ -1518,7 +1525,8 @@ exports.handler = async (event) => {
         language,
         upsellsCatalog,
         currency,
-        propertyName: propertyName || "this property"
+        propertyName: propertyName || "this property",
+        skipStripe: skipStripe || false
       });
 
       bookingFlow.extraction_notes = extraction.extraction_notes;
