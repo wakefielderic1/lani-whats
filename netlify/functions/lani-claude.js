@@ -862,8 +862,9 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
 }
 
 function detectLanguage(text) {
-  const spanishMarkers = /\b(hola|gracias|por favor|quiero|cuanto|cuándo|reservar|habitación|noche|días)\b/i;
-  return spanishMarkers.test(text) ? "es" : "en";
+  const spanishMarkers = /\b(hola|gracias|por favor|quiero|cuanto|cu\u00e1ndo|reservar|habitaci\u00f3n|noche|d\u00edas)\b/i;
+  if (spanishMarkers.test(text)) return "es";
+  return "auto";
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1166,8 +1167,7 @@ async function buildBookingFlowResponse({
   language,
   upsellsCatalog,
   currency,
-  propertyName,
-  skipStripe = false
+  propertyName
 }) {
   const nights = calculateNights(bookingData.check_in, bookingData.check_out);
   if (nights) bookingData.nights = nights;
@@ -1202,25 +1202,21 @@ async function buildBookingFlowResponse({
       );
 
       // ─── STRIPE: crear Checkout Session ───
-      // Si skipStripe=true, se omite (primera llamada — solo reply conversacional)
       // Si falla, checkoutUrl queda null y el flujo continúa.
-      if (!skipStripe) {
-        try {
-          const stripeResult = await createStripeCheckoutSession(
-            bookingDataPayload,
-            propertyName || "Hotel"
-          );
-          if (stripeResult) {
-            checkoutUrl = stripeResult.checkout_url;
-            stripeSessionId = stripeResult.session_id;
-            tempBookingCode = stripeResult.temp_booking_code;
-          }
-        } catch (err) {
-          console.error("[LANI] Stripe call wrapper failed:", err.message);
-          // checkoutUrl queda null
+      // Make puede revisar si checkout_url existe y caer a fallback.
+      try {
+        const stripeResult = await createStripeCheckoutSession(
+          bookingDataPayload,
+          propertyName || "Hotel"
+        );
+        if (stripeResult) {
+          checkoutUrl = stripeResult.checkout_url;
+          stripeSessionId = stripeResult.session_id;
+          tempBookingCode = stripeResult.temp_booking_code;
         }
-      } else {
-        console.log("[LANI] skipStripe=true — omitiendo Stripe Checkout Session");
+      } catch (err) {
+        console.error("[LANI] Stripe call wrapper failed:", err.message);
+        // checkoutUrl queda null
       }
     } else {
       console.warn("[LANI] READY_TO_HOLD validation failed:", validation.errors);
@@ -1278,7 +1274,7 @@ exports.handler = async (event) => {
 
   try {
     let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw;
-    let activeBookingRaw, roomRatesRaw, propertyName, upsellsRaw, currency, skipStripe;
+    let activeBookingRaw, roomRatesRaw, propertyName, upsellsRaw, currency;
 
     const contentType = event.headers["content-type"] || "";
 
@@ -1295,7 +1291,6 @@ exports.handler = async (event) => {
       propertyName      = params.get("propertyName") || "";
       upsellsRaw        = params.get("upsells") || "";
       currency          = params.get("currency") || "USD";
-      skipStripe        = params.get("skipStripe") === "true";
     } else {
       const body = JSON.parse(event.body);
       systemPrompt      = body.systemPrompt || "";
@@ -1309,7 +1304,6 @@ exports.handler = async (event) => {
       propertyName      = body.propertyName || "";
       upsellsRaw        = body.upsells || "";
       currency          = body.currency || "USD";
-      skipStripe        = body.skipStripe === true;
     }
 
     if (!userMessage) {
@@ -1525,8 +1519,7 @@ exports.handler = async (event) => {
         language,
         upsellsCatalog,
         currency,
-        propertyName: propertyName || "this property",
-        skipStripe: skipStripe || false
+        propertyName: propertyName || "this property"
       });
 
       bookingFlow.extraction_notes = extraction.extraction_notes;
@@ -1542,7 +1535,18 @@ If a guest asks about something not covered here (room types, prices, amenities,
 "I don't have that information available right now. Please contact [owner name] directly for assistance."
 NEVER invent, assume, or borrow details from other properties or your general knowledge.
 If a field is empty or not mentioned in this prompt, treat it as unknown — do not fill in the gap.
-This rule overrides everything else.`;
+This rule overrides everything else.
+
+LANGUAGE RULE — CRITICAL:
+ALWAYS respond in the EXACT same language the guest is writing in.
+- Guest writes in English → respond in English
+- Guest writes in Spanish → respond in Spanish
+- Guest writes in Tagalog → respond in Tagalog
+- Guest writes in Cebuano/Bisaya → respond in Cebuano
+- Guest writes in any other language → respond in that language
+NEVER switch languages mid-conversation unless the guest switches first.
+This language rule applies to ALL messages: greetings, booking questions, confirmations, upsell offers.
+Match the guest language exactly — do not default to English or Spanish.`;
 
     let bookingContext = "";
 
