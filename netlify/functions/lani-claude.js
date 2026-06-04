@@ -1,11 +1,15 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v7 (roomRates formato dinámico)
-// Cambios vs v6:
-//   1. Nueva función normalizeRoomRates() — soporta formato viejo
-//      {"garden_room": 800} Y formato nuevo
-//      {"room_1": {"name": "Recámara Principal", "price": 800}}
-//   2. normalizeRoomRates() aplicado al inicio del handler
-//   3. ratesText en extractBookingData filtra solo valores numéricos
+// LANI CLAUDE BACKEND — v8 (fix de raíz para room price = 0)
+// Cambios vs v7:
+//   1. normalizeRoomRates() ahora guarda TODAS las variantes de key:
+//      - normalizada (recamara_principal)
+//      - con espacios (recamara principal)
+//      - original exacta (Recamara Principal)
+//      - en minúsculas (recamara principal)
+//   2. lookupRoomPrice() — función centralizada de búsqueda de precio
+//      que intenta todas las variantes antes de retornar null
+//   3. buildBookingDataPayload(), calculateTotal() y validateReadyToHold()
+//      usan lookupRoomPrice() — fix aplica a todas las propiedades
 // ═══════════════════════════════════════════════════════════════════
 
 const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
@@ -369,26 +373,84 @@ function formatForWhatsApp(text) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// NORMALIZAR ROOMRATES — v7
+// NORMALIZAR ROOMRATES — v8
 // Soporta formato viejo: {"garden_room": 800}
-// Y formato nuevo:       {"room_1": {"name": "Recámara Principal", "price": 800}}
-// Devuelve siempre formato plano: {"recámara_principal": 800, "room_1": 800}
+// Y formato nuevo:       {"room_1": {"name": "Recamara Principal", "price": 800}}
+// Guarda TODAS las variantes posibles de cada key para máxima compatibilidad:
+//   - key original (room_1, garden_room)
+//   - nombre normalizado con _ (recamara_principal)
+//   - nombre con espacios en minúsculas (recamara principal)
+//   - nombre original exacto (Recamara Principal)
 // ─────────────────────────────────────────────────────────────────
 function normalizeRoomRates(roomRates) {
   if (!roomRates || typeof roomRates !== 'object') return {};
   const normalized = {};
+
+  function storeAllVariants(name, price) {
+    if (!name || typeof price !== 'number' || price <= 0) return;
+    // 1. Nombre con _ en minúsculas: recamara_principal
+    normalized[name.toLowerCase().replace(/\s+/g, '_')] = price;
+    // 2. Nombre con espacios en minúsculas: recamara principal
+    normalized[name.toLowerCase()] = price;
+    // 3. Nombre original exacto: Recamara Principal
+    normalized[name] = price;
+    // 4. Nombre con _ original: Recamara_Principal
+    normalized[name.replace(/\s+/g, '_')] = price;
+  }
+
   for (const [k, v] of Object.entries(roomRates)) {
     if (typeof v === 'number' && v > 0) {
-      // Formato viejo — guardar directo
+      // Formato viejo — guardar directo + variantes del key
       normalized[k] = v;
+      storeAllVariants(k.replace(/_/g, ' '), v);
     } else if (v && typeof v === 'object' && typeof v.price === 'number' && v.price > 0 && v.name) {
-      // Formato nuevo — guardar por nombre normalizado Y por key original (room_1, room_2, etc.)
-      const nameKey = v.name.toLowerCase().replace(/\s+/g, '_');
-      normalized[nameKey] = v.price;
-      normalized[k] = v.price; // también por room_1, room_2, room_3
+      // Formato nuevo — guardar por key original Y todas las variantes del nombre
+      normalized[k] = v.price; // room_1, room_2, room_3
+      storeAllVariants(v.name, v.price);
     }
   }
   return normalized;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// LOOKUP DE PRECIO POR ROOM TYPE — v8
+// Función centralizada que busca el precio probando todas las
+// variantes posibles del room_type. Elimina el código duplicado
+// de búsqueda en calculateTotal, buildBookingDataPayload y validate.
+// ─────────────────────────────────────────────────────────────────
+function lookupRoomPrice(roomType, roomRates) {
+  if (!roomType || !roomRates || Object.keys(roomRates).length === 0) return null;
+
+  // Lista de variantes a probar en orden
+  const variants = [
+    roomType,                                          // exacto: "Recamara Principal"
+    roomType.toLowerCase(),                            // lower: "recamara principal"
+    roomType.toLowerCase().replace(/\s+/g, '_'),       // snake: "recamara_principal"
+    roomType.replace(/\s+/g, '_'),                     // snake original: "Recamara_Principal"
+    roomType.toLowerCase().replace(/_/g, ' '),         // spaces: "recamara principal"
+    roomType.replace(/_/g, ' '),                       // spaces original: "Recamara Principal"
+  ];
+
+  for (const variant of variants) {
+    if (roomRates[variant] !== undefined && typeof roomRates[variant] === 'number') {
+      console.log(`[LANI] lookupRoomPrice: found "${roomType}" → key "${variant}" → ${roomRates[variant]}`);
+      return roomRates[variant];
+    }
+  }
+
+  // Último recurso: buscar por inclusión parcial
+  const targetNorm = roomType.toLowerCase().replace(/[\s_]+/g, '');
+  for (const [k, v] of Object.entries(roomRates)) {
+    if (typeof v !== 'number') continue;
+    const keyNorm = k.toLowerCase().replace(/[\s_]+/g, '');
+    if (keyNorm === targetNorm) {
+      console.log(`[LANI] lookupRoomPrice: fuzzy match "${roomType}" → key "${k}" → ${v}`);
+      return v;
+    }
+  }
+
+  console.warn(`[LANI] lookupRoomPrice: NO match for "${roomType}" in keys: ${Object.keys(roomRates).join(', ')}`);
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -439,27 +501,7 @@ function calculateNights(checkIn, checkOut) {
 
 function calculateTotal(roomType, nights, roomRates) {
   if (!roomType || !nights || !roomRates) return null;
-
-  const roomKey = roomType.toLowerCase().replace(/\s+/g, "_");
-
-  let rate =
-    roomRates[roomKey] ||
-    roomRates[roomType] ||
-    roomRates[roomType.toLowerCase()] ||
-    roomRates[roomType.replace(/_/g, " ")] ||
-    null;
-
-  if (!rate && Object.keys(roomRates).length > 0) {
-    for (const [k, v] of Object.entries(roomRates)) {
-      if (typeof v !== 'number') continue;
-      const normalizedKey = k.toLowerCase().replace(/\s+/g, "_");
-      if (normalizedKey === roomKey) {
-        rate = v;
-        break;
-      }
-    }
-  }
-
+  const rate = lookupRoomPrice(roomType, roomRates);
   if (!rate) return null;
   return rate * nights;
 }
@@ -839,17 +881,7 @@ function validateReadyToHold(bookingData, roomRates) {
   }
 
   if (bookingData.room_type && roomRates && Object.keys(roomRates).length > 0) {
-    const roomKey = bookingData.room_type.toLowerCase().replace(/\s+/g, "_");
-    let rate = roomRates[roomKey] || roomRates[bookingData.room_type] || null;
-
-    if (!rate) {
-      for (const [k, v] of Object.entries(roomRates)) {
-        if (typeof v !== 'number') continue;
-        const normalizedKey = k.toLowerCase().replace(/\s+/g, "_");
-        if (normalizedKey === roomKey) { rate = v; break; }
-      }
-    }
-
+    const rate = lookupRoomPrice(bookingData.room_type, roomRates);
     if (!rate) errors.push(`room_type "${bookingData.room_type}" not in rates`);
   }
 
@@ -865,22 +897,12 @@ function validateReadyToHold(bookingData, roomRates) {
 // ═══════════════════════════════════════════════════════════════════
 function buildBookingDataPayload(bookingData, roomRates, nights, language, upsellsCatalog, currency) {
   const roomTypeRaw = bookingData.room_type || "";
-  const roomKey = roomTypeRaw.toLowerCase().replace(/\s+/g, "_");
+  const pricePerNight = lookupRoomPrice(roomTypeRaw, roomRates) || 0;
 
-  let pricePerNight = roomRates[roomKey] || roomRates[roomTypeRaw] || roomRates[roomTypeRaw.toLowerCase()] || null;
-
-  if (!pricePerNight && roomRates && Object.keys(roomRates).length > 0) {
-    for (const [k, v] of Object.entries(roomRates)) {
-      if (typeof v !== 'number') continue;
-      const normalizedKey = k.toLowerCase().replace(/\s+/g, "_");
-      if (normalizedKey === roomKey) { pricePerNight = v; break; }
-    }
-  }
-
-  const roomDisplay = roomTypeRaw
-    .split(/[_\s]+/)
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join(" ");
+  const roomKey = roomTypeRaw.toLowerCase().replace(/\s+/g, '_');
+  const roomDisplay = roomTypeRaw.includes('_')
+    ? roomTypeRaw.split(/[_\s]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ")
+    : roomTypeRaw;
 
   const roomsSubtotal = (pricePerNight && nights) ? pricePerNight * nights : 0;
 
