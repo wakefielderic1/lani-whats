@@ -557,7 +557,7 @@ function calculateAddOnSubtotal(addOn, guestsCount, nights) {
 
   switch (addOn.type) {
     case "flat":              return addOn.price * qty;
-    case "per_person":        return addOn.price * guests * qty;
+    case "per_person":      return addOn.price * qty;
     case "per_person_per_night": return addOn.price * guests * n;
     case "per_hour":          return addOn.price * (addOn.hours || 1);
     default:                  return addOn.price * qty;
