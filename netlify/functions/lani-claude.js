@@ -669,12 +669,22 @@ async function extractBookingData({
   const cur = currency || "USD";
 
   // ratesText — solo muestra valores numéricos (ya normalizados)
-  const ratesText = roomRates && Object.keys(roomRates).length > 0
-    ? Object.entries(roomRates)
-        .filter(([k, v]) => typeof v === 'number')
-        .map(([k, v]) => `- ${k}: ${cur} ${v}/night`)
-        .join("\n")
-    : "(no room rates configured)";
+// Construir ratesText con nombres legibles, sin duplicados
+const seenPrices = new Set();
+const ratesText = roomRates && Object.keys(roomRates).length > 0
+  ? Object.entries(roomRates)
+      .filter(([k, v]) => {
+        if (typeof v !== 'number') return false;
+        // Preferir keys con espacios (nombres legibles) sobre keys con _
+        if (k.includes('_') && roomRates[k.replace(/_/g, ' ')] !== undefined) return false;
+        const key = `${k}-${v}`;
+        if (seenPrices.has(key)) return false;
+        seenPrices.add(key);
+        return true;
+      })
+      .map(([k, v]) => `- ${k}: ${cur} ${v}/night`)
+      .join("\n")
+  : "(no room rates configured)";
 
   const catalog = Array.isArray(upsellsCatalog) ? upsellsCatalog : [];
   const upsellsText = catalog.length > 0
