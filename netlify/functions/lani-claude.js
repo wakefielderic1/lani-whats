@@ -418,8 +418,10 @@ function normalizeRoomRates(roomRates) {
 // variantes posibles del room_type. Elimina el código duplicado
 // de búsqueda en calculateTotal, buildBookingDataPayload y validate.
 // ─────────────────────────────────────────────────────────────────
+
 function lookupRoomPrice(roomType, roomRates) {
-  if (!roomType || !roomRates || Object.keys(roomRates).length === 0) return null;
+  console.log("[LANI] lookupRoomPrice called with:", roomType, "| keys:", Object.keys(roomRates));
+  if (!roomType || !roomRates || Object.keys(roomRates).length === 0) return null;   if (!roomType || !roomRates || Object.keys(roomRates).length === 0) return null;
 
   // Lista de variantes a probar en orden
   const variants = [
