@@ -115,13 +115,26 @@ async function getConversations(sheets) {
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
     if (!row[4] || row[4] !== PROPERTY_ID) continue;
-    let history = { summary: "", messages: [] };
-    try { history = JSON.parse(row[2] || "{}"); } catch {}
+    let messages = [];
+    let summary = "";
+    try {
+      const raw = JSON.parse(row[2] || "[]");
+      if (Array.isArray(raw)) {
+        // Direct array format: [{role, content}, ...]
+        messages = raw;
+        const lastAssistant = [...raw].reverse().find(m => m.role === "assistant");
+        summary = lastAssistant ? lastAssistant.content.slice(0, 120) : "";
+      } else if (raw && typeof raw === "object") {
+        // Object format: {summary: "", messages: [...]}
+        messages = raw.messages || [];
+        summary = raw.summary || "";
+      }
+    } catch (e) {}
     convs.push({
       phone: row[0] || "",
       last_updated: row[3] || "",
-      summary: history.summary || "",
-      messages: (history.messages || []).slice(-10), // last 10 messages only
+      summary,
+      messages: messages.slice(-20),
     });
   }
   return convs;
