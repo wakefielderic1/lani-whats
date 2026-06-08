@@ -27,7 +27,7 @@ function getStripeClient() {
   try {
     const Stripe = require("stripe");
     stripeClient = Stripe(process.env.STRIPE_SECRET_KEY, {
-      apiVersion: "2024-06-20",
+      apiVersion: "2026-04-22.dahlia",
       timeout: 8000, // 8s timeout para no bloquear el flujo
       maxNetworkRetries: 1
     });
@@ -1334,8 +1334,6 @@ exports.handler = async (event) => {
     // ─────────────────────────────────────────────────────────────
     // MODO IDENTIFICACIÓN — no hay propertyId aún
     // ─────────────────────────────────────────────────────────────
-    const preIdLanguage = detectLanguage(userMessage);
-
     if (!propertyId && propertiesList.length > 0) {
 
       let pendingFlatList = null;
@@ -1386,12 +1384,7 @@ exports.handler = async (event) => {
         const confirmedProperty = listToDetect.find(p => p.property_id === detected);
 
         if (confirmedProperty) {
-          const greetings = {
-            en: `Hi! I'm LANI 👋, your virtual assistant for *${confirmedProperty.name}*. How can I help you today? 😊`,
-            tl: `Kumusta! Ako si LANI 👋, ang inyong virtual assistant ng *${confirmedProperty.name}*. Paano kita matutulungan ngayon? 😊`,
-            es: `¡Hola! Soy LANI 👋, tu asistente virtual de *${confirmedProperty.name}*. ¿En qué puedo ayudarte hoy? 😊`
-          };
-          const confirmMsg = greetings[preIdLanguage] || greetings.en;
+          const confirmMsg = `¡Hola! Soy LANI 👋, tu asistente virtual de *${confirmedProperty.name}*. ¿En qué puedo ayudarte hoy? 😊`;
 
           const updatedMessages = [
             { role: "user", content: userMessage },
@@ -1441,16 +1434,8 @@ exports.handler = async (event) => {
       const { optionsText, flatList } = buildSelectionMessage(propertiesList, null);
 
       const selectionMsg = detected === "AMBIGUOUS"
-        ? (preIdLanguage === "tl"
-          ? `Nakahanap ako ng higit sa isang property. Alin ang hinahanap mo?\n\n${optionsText}\n\nSagot ng numero o pangalan. 😊`
-          : preIdLanguage === "es"
-          ? `Encontré más de una propiedad que podría coincidir. ¿Cuál te interesa?\n\n${optionsText}\n\nResponde con el número o nombre. 😊`
-          : `I found more than one property that might match. Which one are you looking for?\n\n${optionsText}\n\nReply with the number or name. 😊`)
-        : (preIdLanguage === "tl"
-          ? `Kumusta! Ako si LANI 👋 Alin sa aming mga property ang gusto mong makausap?\n\n${optionsText}\n\nSagot ng numero o pangalan.`
-          : preIdLanguage === "es"
-          ? `¡Hola! Soy LANI 👋 ¿Con cuál de nuestras propiedades quieres contactar?\n\n${optionsText}\n\nResponde con el número o nombre.`
-          : `Hi! I'm LANI 👋 Which of our properties would you like to contact?\n\n${optionsText}\n\nReply with the number or name.`);
+        ? `Encontré más de una propiedad que podría coincidir. ¿Cuál te interesa?\n\n${optionsText}\n\nResponde con el número o nombre. 😊`
+        : `¡Hola! Soy LANI 👋 ¿Con cuál de nuestras propiedades quieres contactar?\n\n${optionsText}\n\nResponde con el número o nombre.`;
 
       const updatedMessages = [
         { role: "user", content: userMessage },
