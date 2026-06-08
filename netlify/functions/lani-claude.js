@@ -1169,9 +1169,7 @@ async function buildBookingFlowResponse({
   language,
   upsellsCatalog,
   currency,
-  propertyName,
-  propertyId,
-  ownerWhatsapp
+  propertyName
 }) {
   const nights = calculateNights(bookingData.check_in, bookingData.check_out);
   if (nights) bookingData.nights = nights;
@@ -1525,9 +1523,7 @@ exports.handler = async (event) => {
         language,
         upsellsCatalog,
         currency,
-        propertyName: propertyName || "this property",
-        propertyId: propertyId || "",
-        ownerWhatsapp: ownerWhatsapp || ""
+        propertyName: propertyName || "this property"
       });
 
       bookingFlow.extraction_notes = extraction.extraction_notes;
