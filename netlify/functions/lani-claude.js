@@ -1388,7 +1388,12 @@ exports.handler = async (event) => {
         const confirmedProperty = listToDetect.find(p => p.property_id === detected);
 
         if (confirmedProperty) {
-          const confirmMsg = `¡Hola! Soy LANI 👋, tu asistente virtual de *${confirmedProperty.name}*. ¿En qué puedo ayudarte hoy? 😊`;
+          const greetings = {
+            en: `Hi! I'm LANI 👋, your virtual assistant for *${confirmedProperty.name}*. How can I help you today? 😊`,
+            tl: `Kumusta! Ako si LANI 👋, ang inyong virtual assistant ng *${confirmedProperty.name}*. Paano kita matutulungan ngayon? 😊`,
+            es: `¡Hola! Soy LANI 👋, tu asistente virtual de *${confirmedProperty.name}*. ¿En qué puedo ayudarte hoy? 😊`
+          };
+          const confirmMsg = greetings[preIdLanguage] || greetings.en;
 
           const updatedMessages = [
             { role: "user", content: userMessage },
@@ -1439,7 +1444,11 @@ exports.handler = async (event) => {
 
       const selectionMsg = detected === "AMBIGUOUS"
         ? `Encontré más de una propiedad que podría coincidir. ¿Cuál te interesa?\n\n${optionsText}\n\nResponde con el número o nombre. 😊`
-        : `¡Hola! Soy LANI 👋 ¿Con cuál de nuestras propiedades quieres contactar?\n\n${optionsText}\n\nResponde con el número o nombre.`;
+        : (preIdLanguage === "tl"
+          ? `Kumusta! Ako si LANI 👋 Alin sa aming mga property ang gusto mong makausap?\n\n${optionsText}\n\nSagot ng numero o pangalan.`
+          : preIdLanguage === "es"
+          ? `¡Hola! Soy LANI 👋 ¿Con cuál de nuestras propiedades quieres contactar?\n\n${optionsText}\n\nResponde con el número o nombre.`
+          : `Hi! I'm LANI 👋 Which of our properties would you like to contact?\n\n${optionsText}\n\nReply with the number or name.`);
 
       const updatedMessages = [
         { role: "user", content: userMessage },
