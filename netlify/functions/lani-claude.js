@@ -1025,7 +1025,7 @@ function buildBookingDataPayload(bookingData, roomRates, nights, language, upsel
 // Retorna { checkout_url, session_id } o null si Stripe falla.
 // El booking debe seguir adelante aunque esto retorne null.
 // ═══════════════════════════════════════════════════════════════════
-async function createStripeCheckoutSession(bookingPayload, propertyName) {
+async function createStripeCheckoutSession(bookingPayload, propertyName, propertyId, ownerWhatsapp) {
   const stripe = getStripeClient();
   if (!stripe) {
     console.warn("[LANI] Stripe client not available, skipping checkout creation");
@@ -1130,7 +1130,9 @@ async function createStripeCheckoutSession(bookingPayload, propertyName) {
       expires_at: Math.floor(Date.now() / 1000) + 30 * 60, // 30 min HOLD
       metadata: {
         booking_code: tempBookingCode,
+        property_id: propertyId || "",
         property_name: propertyName,
+        owner_whatsapp: ownerWhatsapp || "",
         guest_name: bookingPayload.guest_name || "",
         guest_phone: bookingPayload.guest_phone || "",
         check_in: bookingPayload.check_in || "",
@@ -1207,7 +1209,9 @@ async function buildBookingFlowResponse({
       try {
         const stripeResult = await createStripeCheckoutSession(
           bookingDataPayload,
-          propertyName || "Hotel"
+          propertyName || "Hotel",
+          propertyId || "",
+          ownerWhatsapp || ""
         );
         if (stripeResult) {
           checkoutUrl = stripeResult.checkout_url;
