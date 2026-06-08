@@ -27,7 +27,7 @@ function getStripeClient() {
   try {
     const Stripe = require("stripe");
     stripeClient = Stripe(process.env.STRIPE_SECRET_KEY, {
-      apiVersion: "2026-04-22.dahlia",
+      apiVersion: "2024-06-20",
       timeout: 8000, // 8s timeout para no bloquear el flujo
       maxNetworkRetries: 1
     });
