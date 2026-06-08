@@ -1336,6 +1336,8 @@ exports.handler = async (event) => {
     // ─────────────────────────────────────────────────────────────
     // MODO IDENTIFICACIÓN — no hay propertyId aún
     // ─────────────────────────────────────────────────────────────
+    const preIdLanguage = detectLanguage(userMessage);
+
     if (!propertyId && propertiesList.length > 0) {
 
       let pendingFlatList = null;
