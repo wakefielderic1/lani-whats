@@ -1,17 +1,24 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v6 (con Stripe Checkout integration)
-// Cambios vs v5:
-//   1. Import de Stripe SDK + lazy init
-//   2. Nueva función createStripeCheckoutSession() con line_items por
-//      habitación y add-ons separados, currency dinámica, fallback
-//      resiliente (try/catch — si Stripe falla, booking sigue sin link)
-//   3. Llamada a Stripe en buildBookingFlowResponse cuando stage===READY_TO_HOLD
-//      → agrega checkout_url al payload de respuesta para que Make lo use
+// LANI CLAUDE BACKEND — v11
+// Changelog:
+//   v11 (Jun 2026):
+//     - Language default changed to English (was Spanish)
+//     - detectLanguage() — added Tagalog/Filipino markers; default "en"
+//     - FIELD_QUESTIONS_TL — Tagalog booking questions added
+//     - getFieldQuestions(language) — routes TL / ES / EN correctly
+//     - OWNER PRIVACY rule — LANI never shares owner phone/WhatsApp
+//     - Error/timeout messages now in guest's language, no Spanish default
+//     - MAX_HISTORY 20→40, SUMMARY_THRESHOLD 10→30 (less aggressive cuts)
+//     - summarizeHistory() — structured format preserves booking data fields
+//     - History slice after summary: 4→8 messages kept
+//     - Stripe apiVersion: dahlia beta → "2024-06-20" stable
+//     - Pre-identification messages default to English
+//     - READY_TO_HOLD context includes explicit language instruction
 // ═══════════════════════════════════════════════════════════════════
 
 const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
-const MAX_HISTORY = 20;
-const SUMMARY_THRESHOLD = 10;
+const MAX_HISTORY = 40;
+const SUMMARY_THRESHOLD = 30;
 const TIMEOUT_MS = 20000;
 
 // ─── STRIPE CONFIG ───
@@ -27,7 +34,7 @@ function getStripeClient() {
   try {
     const Stripe = require("stripe");
     stripeClient = Stripe(process.env.STRIPE_SECRET_KEY, {
-      apiVersion: "2026-04-22.dahlia",
+      apiVersion: "2024-06-20",
       timeout: 8000, // 8s timeout para no bloquear el flujo
       maxNetworkRetries: 1
     });
@@ -76,7 +83,25 @@ function withTimeout(promise, ms) {
 }
 
 async function summarizeHistory(messages, systemPrompt) {
-  const summaryPrompt = `Summarize this conversation in 3-4 sentences, keeping key details like names, dates, room preferences, and any issues mentioned:\n\n${messages.map(m => `${m.role}: ${m.content}`).join("\n")}`;
+  const summaryPrompt = `Summarize this hotel booking conversation. You MUST preserve ALL of the following data points if they appear anywhere in the conversation — do NOT omit or paraphrase them:
+
+- Guest full name (exact spelling)
+- Guest email address (exact)
+- Guest phone number (exact digits)
+- Check-in date (exact: YYYY-MM-DD)
+- Check-out date (exact: YYYY-MM-DD)
+- Room type selected
+- Number of guests
+- Any confirmed upsells/add-ons (name + quantity)
+- Total amount discussed
+- Any special requests
+
+Format your summary as:
+BOOKING DATA: [list every field above that has a value, one per line]
+CONVERSATION CONTEXT: [2-3 sentences summarizing the conversation flow and any issues]
+
+Conversation to summarize:
+${messages.map(m => `${m.role}: ${m.content}`).join("\n")}`;
 
   const response = await fetch(ANTHROPIC_API, {
     method: "POST",
@@ -87,7 +112,7 @@ async function summarizeHistory(messages, systemPrompt) {
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 300,
+      max_tokens: 500,
       system: systemPrompt,
       messages: [{ role: "user", content: summaryPrompt }]
     })
@@ -247,17 +272,17 @@ function getPreIdentificationResponse(category, propertiesList) {
   const { optionsText } = buildSelectionMessage(propertiesList, null);
 
   const responses = {
-    IDENTITY_PROBE: `Soy LANI 🌴 manejo las reservas y preguntas de varios hoteles boutique. ¿Con cuál quieres contactar?\n\n${optionsText}\n\nResponde con el número o nombre.`,
+    IDENTITY_PROBE: `I'm LANI 🌴, a virtual assistant that handles bookings and questions for boutique hotels. Which property would you like to contact?\n\n${optionsText}\n\nReply with the number or name.`,
 
-    SECURITY_PROBE: `Jeje, solo soy LANI 🌴 ¿Con cuál de nuestras propiedades quieres contactar?\n\n${optionsText}\n\nResponde con el número o nombre.`,
+    SECURITY_PROBE: `Ha, I'm just LANI 🌴! Which of our properties would you like to contact?\n\n${optionsText}\n\nReply with the number or name.`,
 
-    INFO_REQUEST: `Cada propiedad tiene sus precios y detalles propios 🌴 ¿Cuál te interesa?\n\n${optionsText}\n\nResponde con el número o nombre y te paso la info.`,
+    INFO_REQUEST: `Each property has its own prices and details 🌴 Which one are you interested in?\n\n${optionsText}\n\nReply with the number or name and I'll get you the info.`,
 
-    OFF_TOPIC: `Jeje, ahí no te puedo ayudar — pero si necesitas algo de hospedaje, dale 🌴 ¿Con cuál propiedad quieres contactar?\n\n${optionsText}\n\nResponde con el número o nombre.`,
+    OFF_TOPIC: `Ha, that's outside my area of expertise — but if you need a place to stay, I've got you 🌴 Which property would you like to contact?\n\n${optionsText}\n\nReply with the number or name.`,
 
-    NEGOTIATION: `Cada hotel maneja sus propios precios 🌴 Primero dime cuál te interesa:\n\n${optionsText}\n\nResponde con el número o nombre y vemos qué te late.`,
+    NEGOTIATION: `Each hotel manages its own pricing 🌴 First, tell me which one you're interested in:\n\n${optionsText}\n\nReply with the number or name.`,
 
-    EMERGENCY: `Si es una emergencia, llama a los servicios locales primero. Para temas del hotel, dime con cuál estás contactando:\n\n${optionsText}\n\nResponde con el número o nombre.`
+    EMERGENCY: `If this is an emergency, please contact local services first. For hotel-related matters, which property are you trying to reach?\n\n${optionsText}\n\nReply with the number or name.`
   };
 
   return responses[category] || null;
@@ -419,6 +444,22 @@ const FIELD_QUESTIONS_EN = {
   guest_email: "What's your email address? I'll need it to send you the confirmation.",
   guest_phone: "Could you share a phone number where we can reach you?"
 };
+
+const FIELD_QUESTIONS_TL = {
+  room_type: "Anong uri ng kwarto ang gusto mo?",
+  check_in: "Kailan ang iyong check-in date?",
+  check_out: "At kailan ang check-out?",
+  guests_count: "Ilang tao ang mananabí?",
+  guest_name: "Pwede mo bang ibigay ang iyong buong pangalan?",
+  guest_email: "Ano ang iyong email address? Kailangan ko ito para sa confirmation.",
+  guest_phone: "Pwede mo bang ibigay ang iyong phone number para makontak ka namin?"
+};
+
+function getFieldQuestions(language) {
+  if (language === "tl") return FIELD_QUESTIONS_TL;
+  if (language === "es") return FIELD_QUESTIONS_ES;
+  return FIELD_QUESTIONS_EN;
+}
 
 function getTodayISO() {
   return new Date().toISOString().slice(0, 10);
@@ -862,9 +903,19 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
 }
 
 function detectLanguage(text) {
-  const spanishMarkers = /\b(hola|gracias|por favor|quiero|cuanto|cu\u00e1ndo|reservar|habitaci\u00f3n|noche|d\u00edas)\b/i;
-  if (spanishMarkers.test(text)) return "es";
-  return "auto";
+  if (!text) return "en";
+  const lower = text.toLowerCase();
+
+  // Tagalog/Filipino markers — check first since some overlap with English
+  const tagalogMarkers = /\b(po|ako|gusto|magbook|anong|pwede|salamat|namin|kayo|sige|oo|hindi|ba|yung|nang|ng ng|itong|sino|paano|kumusta|mahal|libre|alin|paki|pakitagalog|pakisabi|pakiusap|maraming|dalawa|tatlo|apat|lima|araw|gabi|umaga|hapon|bukas|kahapon|ngayon|dito|doon|dito|nandito|nandoon|kailan|saan|bakit|mayroon|meron|wala|lahat|lang|din|rin|pala|talaga|syempre|syempre|naman|kasi|pero|tapos|saka|at|kung|para|sa|na|ng|mga)\b/i;
+  if (tagalogMarkers.test(lower)) return "tl";
+
+  // Spanish markers
+  const spanishMarkers = /\b(hola|gracias|por favor|quiero|cuanto|cuándo|reservar|habitación|noche|días|buenas|buenos|necesito|tengo|hacer|fecha|llegada|salida|disponible|precio|cuántas|personas|nombre|correo|teléfono|pagar|reserva|confirmar)\b/i;
+  if (spanishMarkers.test(lower)) return "es";
+
+  // Default to English
+  return "en";
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1229,24 +1280,30 @@ async function buildBookingFlowResponse({
       stage = "GATHERING_DATA";
       validationErrors = validation.errors;
       nextQuestion = "confirmation";
-      suggestedReply = language === "es"
+      suggestedReply = language === "tl"
+        ? "Pwede mo bang kumpirmahin ang mga detalye ng iyong booking bago ko i-hold?"
+        : language === "es"
         ? "¿Me confirmas los datos de tu reserva antes de apartarla?"
         : "Could you confirm your booking details before I place the hold?";
     }
   } else {
     stage = "GATHERING_DATA";
     nextQuestion = missing[0];
-    const questions = language === "es" ? FIELD_QUESTIONS_ES : FIELD_QUESTIONS_EN;
+    const questions = getFieldQuestions(language);
     suggestedReply = questions[nextQuestion];
 
     if (nextQuestion === "room_type" && roomRates && Object.keys(roomRates).length > 0) {
       const cur = currency || "USD";
       const roomList = Object.entries(roomRates)
-        .map(([k, v]) => `- ${k.charAt(0).toUpperCase() + k.slice(1)}: ${cur} ${v}/noche`)
+        .map(([k, v]) => `- ${k.charAt(0).toUpperCase() + k.slice(1)}: ${cur} ${v}/night`)
         .join("\n");
-      suggestedReply = language === "es"
-        ? `${suggestedReply}\n\nTenemos disponibles:\n${roomList}`
-        : `${suggestedReply}\n\nWe have available:\n${roomList}`;
+      if (language === "tl") {
+        suggestedReply = `${suggestedReply}\n\nMga available na kwarto:\n${roomList}`;
+      } else if (language === "es") {
+        suggestedReply = `${suggestedReply}\n\nTenemos disponibles:\n${roomList}`;
+      } else {
+        suggestedReply = `${suggestedReply}\n\nAvailable rooms:\n${roomList}`;
+      }
     }
   }
 
@@ -1419,7 +1476,7 @@ exports.handler = async (event) => {
         const location = detected.replace("LOCATION_MULTIPLE:", "").trim();
         const { optionsText, flatList } = buildSelectionMessage(propertiesList, location);
 
-        const selectionMsg = `Tenemos estas propiedades en *${location}*:\n\n${optionsText}\n\nResponde con el número o nombre de la que te interesa. 😊`;
+        const selectionMsg = `We have these properties in *${location}*:\n\n${optionsText}\n\nReply with the number or name of the one you're interested in. 😊`;
 
         const updatedMessages = [
           { role: "user", content: userMessage },
@@ -1443,7 +1500,7 @@ exports.handler = async (event) => {
       const { optionsText, flatList } = buildSelectionMessage(propertiesList, null);
 
       const selectionMsg = detected === "AMBIGUOUS"
-        ? `Encontré más de una propiedad que podría coincidir. ¿Cuál te interesa?\n\n${optionsText}\n\nResponde con el número o nombre. 😊`
+        ? `I found more than one property that could match. Which one are you interested in?\n\n${optionsText}\n\nReply with the number or name. 😊`
         : (preIdLanguage === "tl"
           ? `Kumusta! Ako si LANI 👋 Alin sa aming mga property ang gusto mong makausap?\n\n${optionsText}\n\nSagot ng numero o pangalan.`
           : preIdLanguage === "es"
@@ -1501,7 +1558,7 @@ exports.handler = async (event) => {
       if (previousMessages.length >= SUMMARY_THRESHOLD) {
         const summary = await summarizeHistory(previousMessages, systemPrompt);
         conversationSummary = summary;
-        previousMessages = previousMessages.slice(-4);
+        previousMessages = previousMessages.slice(-8);
       } else if (previousMessages.length > MAX_HISTORY) {
         previousMessages = previousMessages.slice(-MAX_HISTORY);
       }
@@ -1551,21 +1608,29 @@ exports.handler = async (event) => {
 CRITICAL RULE — DATA INTEGRITY:
 You must ONLY use information explicitly provided in this system prompt to answer guest questions.
 If a guest asks about something not covered here (room types, prices, amenities, policies, availability, or any other detail), respond exactly like this:
-"I don't have that information available right now. Please contact [owner name] directly for assistance."
+"I don't have that information available right now. I'll pass your question to the property team."
 NEVER invent, assume, or borrow details from other properties or your general knowledge.
 If a field is empty or not mentioned in this prompt, treat it as unknown — do not fill in the gap.
 This rule overrides everything else.
 
+CRITICAL RULE — OWNER PRIVACY:
+NEVER share the owner's personal phone number, WhatsApp number, or any direct contact details with guests under any circumstances.
+If a guest asks for the owner's contact, asks to speak directly with someone, or requests a phone number, respond like this:
+"I'll pass your message along to the property team and they'll follow up with you shortly."
+Do NOT include any phone number in your response. Do NOT mention the owner's name unless it is already part of the property's public information.
+This applies even if the guest is asking about a service (transfers, pickup, etc.) — never give a phone number, just say you'll escalate.
+
 LANGUAGE RULE — CRITICAL:
 ALWAYS respond in the EXACT same language the guest is writing in.
 - Guest writes in English → respond in English
+- Guest writes in Filipino/Tagalog → respond in Filipino/Tagalog
 - Guest writes in Spanish → respond in Spanish
-- Guest writes in Tagalog → respond in Tagalog
-- Guest writes in Cebuano/Bisaya → respond in Cebuano
+- Guest writes in Taglish (mixed Tagalog/English) → respond in Taglish
 - Guest writes in any other language → respond in that language
+DEFAULT LANGUAGE IS ENGLISH. If you cannot detect the guest's language clearly, respond in English.
 NEVER switch languages mid-conversation unless the guest switches first.
-This language rule applies to ALL messages: greetings, booking questions, confirmations, upsell offers.
-Match the guest language exactly — do not default to English or Spanish.`;
+NEVER default to Spanish — Spanish is only used when the guest writes in Spanish.
+This language rule applies to ALL messages: greetings, booking questions, confirmations, upsell offers, error messages.`;
 
     let bookingContext = "";
 
@@ -1611,7 +1676,8 @@ CRITICAL: Your reply should:
 5. Do NOT say "you've secured the dates" yet — say "I'm checking availability" or "placing a hold"
 6. Do NOT include a payment link — the system will send it next
 7. Keep it warm and natural, 3-5 lines max.
-8. ALWAYS use the currency code ${cur}, never "$" alone or "USD" if currency is different.`;
+8. ALWAYS use the currency code ${cur}, never "$" alone or "USD" if currency is different.
+9. Respond in the guest's language (${language === "tl" ? "Filipino/Tagalog" : language === "es" ? "Spanish" : "English"}).`;
     }
 
     const fullSystemPrompt = conversationSummary
@@ -1653,19 +1719,23 @@ CRITICAL: Your reply should:
 
     } catch (err) {
       if (err.message === "TIMEOUT") {
-        assistantReply = ownerWhatsapp
-          ? `Lo siento, tengo una conexión lenta en este momento. Por favor contáctanos directamente al ${ownerWhatsapp} para ayuda inmediata.`
-          : "Lo siento, estoy experimentando una conexión lenta. Por favor intenta de nuevo en un momento.";
+        assistantReply = language === "tl"
+          ? "Paumanhin, medyo mabagal ang koneksyon ko ngayon. Pakisubukan ulit sa ilang sandali."
+          : language === "es"
+          ? "Lo siento, tengo una conexión lenta en este momento. Por favor intenta de nuevo en un momento."
+          : "I'm sorry, I'm experiencing a slow connection right now. Please try again in a moment.";
       } else {
-        assistantReply = ownerWhatsapp
-          ? `Estoy teniendo dificultades técnicas. Por favor contáctanos directamente al ${ownerWhatsapp}.`
-          : "Estoy teniendo dificultades técnicas. Por favor intenta de nuevo en un momento.";
+        assistantReply = language === "tl"
+          ? "Nagkakaroon ako ng teknikal na problema. Pakisubukan ulit sa ilang sandali."
+          : language === "es"
+          ? "Estoy teniendo dificultades técnicas. Por favor intenta de nuevo en un momento."
+          : "I'm experiencing a technical issue. Please try again in a moment.";
       }
     }
 
     let cleanReply = typeof assistantReply === 'string' ? assistantReply.trim() : String(assistantReply).trim();
     if (cleanReply.startsWith('[') || cleanReply.startsWith('{')) {
-      cleanReply = "Disculpa, hubo un error. Por favor intenta de nuevo.";
+      cleanReply = "Something went wrong on my end. Please try again.";
     }
 
     const updatedMessages = [
