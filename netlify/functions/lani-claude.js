@@ -1663,6 +1663,30 @@ exports.handler = async (event) => {
     }
 
     const language = detectLanguage(userMessage);
+
+    // ── Fix: Detect conversation language from history when current message is ambiguous ──
+    // If current message is in English but conversation was in Spanish/Filipino,
+    // keep the conversation language for suggested_reply generation
+    let conversationLanguage = language;
+    if (language === "en" && previousMessages.length > 0) {
+      const recentUserMsgs = previousMessages
+        .filter(m => m.role === "user")
+        .slice(-5)
+        .map(m => m.content || "")
+        .join(" ");
+      const historyLang = detectLanguage(recentUserMsgs);
+      if (historyLang !== "en") conversationLanguage = historyLang;
+    }
+
+    // ── Fix: Pre-fill guest_phone from activeBooking before extraction ──
+    // Make injects guest_phone from Twilio webhook — use it to seed the booking
+    // so LANI never needs to ask for it
+    if (activeBooking && activeBooking.guest_phone && !activeBooking.guest_phone.includes("From")) {
+      if (!activeBooking.guest_phone.startsWith("{{")) {
+        // Valid phone — will be available in extraction as pre-filled field
+        console.log("[LANI] guest_phone pre-filled from activeBooking:", activeBooking.guest_phone);
+      }
+    }
     let bookingFlow = {
       intent: false, stage: "NONE", data: {}, missing_fields: [],
       next_question: null, booking_data: null, language: language,
@@ -1681,11 +1705,20 @@ exports.handler = async (event) => {
         currency
       });
 
+      // Pre-seed guest_phone from activeBooking if not already in extraction
+      if (activeBooking?.guest_phone && 
+          !activeBooking.guest_phone.startsWith("{{") &&
+          !activeBooking.guest_phone.includes("From") &&
+          !extraction.data.guest_phone) {
+        extraction.data.guest_phone = activeBooking.guest_phone;
+        console.log("[LANI] guest_phone seeded from activeBooking into extraction");
+      }
+
       bookingFlow = await buildBookingFlowResponse({
         bookingData: extraction.data,
         intent: extraction.intent,
         roomRates,
-        language,
+        language: conversationLanguage,
         upsellsCatalog,
         currency,
         propertyName: propertyName || "this property",
