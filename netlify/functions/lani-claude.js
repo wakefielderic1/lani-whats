@@ -1,6 +1,16 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v12
+// LANI CLAUDE BACKEND — v13
 // Changelog:
+//   v13 (Jun 2026):
+//     - Fix 2: guest_phone auto-populated from Twilio webhook via Make
+//       activeBooking.guest_phone is now pre-filled by Make before calling backend.
+//       Protected from being overwritten: pre-filled phone is never replaced
+//       by null/empty from Claude extraction. Also normalized: strips
+//       "whatsapp:+" prefix so only digits+country code are stored.
+//     - Fix 3: message buffering — deduplication guard added to prevent
+//       duplicate processing when guest sends rapid messages.
+//       Handler returns 200 immediately if a message from the same phone
+//       was processed within the last 4 seconds (idempotency window).
 //   v12 (Jun 2026):
 //     - Fix greeting language when guest selects property with a number
 //       (now checks conversation history for language context)
@@ -27,6 +37,32 @@ const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
 const MAX_HISTORY = 40;
 const SUMMARY_THRESHOLD = 30;
 const TIMEOUT_MS = 20000;
+
+// ─── MESSAGE BUFFER — Fix 3 ────────────────────────────────────────
+// Prevents duplicate processing when a guest sends 2-3 rapid messages.
+// Netlify Functions are stateless — deduplicates within same warm instance.
+// Window: 4 seconds. Key: phone number. Value: timestamp of last process.
+const MESSAGE_BUFFER_MS = 4000;
+const recentlyProcessed = new Map();
+
+function isDuplicateMessage(phone) {
+  if (!phone) return false;
+  const last = recentlyProcessed.get(phone);
+  if (!last) return false;
+  return (Date.now() - last) < MESSAGE_BUFFER_MS;
+}
+
+function markProcessed(phone) {
+  if (!phone) return;
+  recentlyProcessed.set(phone, Date.now());
+  // Cleanup old entries to avoid memory leak on long-lived instances
+  if (recentlyProcessed.size > 200) {
+    const cutoff = Date.now() - MESSAGE_BUFFER_MS * 10;
+    for (const [k, v] of recentlyProcessed.entries()) {
+      if (v < cutoff) recentlyProcessed.delete(k);
+    }
+  }
+}
 
 // ─── STRIPE CONFIG ───
 // Lazy-init: solo se inicializa Stripe si STRIPE_SECRET_KEY existe.
@@ -893,6 +929,14 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
       }
     }
 
+    // ── Fix 2: Restore pre-filled guest_phone if Claude cleared it ──
+    // Claude's extractor may return null for guest_phone if the number
+    // never appeared in the chat (because it came from the Twilio webhook).
+    // Always preserve the pre-filled value from activeBooking.
+    if (!mergedData.guest_phone && reconstructedBooking.guest_phone) {
+      mergedData.guest_phone = reconstructedBooking.guest_phone;
+    }
+
     return {
       intent: extracted.intent === true,
       data: mergedData,
@@ -1384,12 +1428,44 @@ exports.handler = async (event) => {
       };
     }
 
+    // ── Fix 3: Message deduplication buffer ──────────────────────
+    // Extracts sender phone early (before full parsing) to check buffer.
+    let senderPhone = null;
+    try {
+      const _ab = typeof activeBookingRaw === 'string' ? JSON.parse(activeBookingRaw) : activeBookingRaw;
+      senderPhone = (_ab && _ab.guest_phone) ? _ab.guest_phone : null;
+    } catch(e) {}
+
+    if (isDuplicateMessage(senderPhone)) {
+      console.log("[LANI] Duplicate message from", senderPhone, "— skipping (buffer window)");
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reply: null, buffered: true })
+      };
+    }
+
     let propertiesList = [];
     try { propertiesList = JSON.parse(propertiesListRaw); } catch (e) { propertiesList = []; }
 
     let activeBooking = {};
     try { activeBooking = typeof activeBookingRaw === 'string' ? JSON.parse(activeBookingRaw) : activeBookingRaw; } catch (e) { activeBooking = {}; }
     if (!activeBooking || typeof activeBooking !== 'object') activeBooking = {};
+
+    // ── Fix 2: Normalize guest_phone from Twilio/Make ────────────
+    // Make now injects activeBooking.guest_phone = {{1.From}} (e.g. "whatsapp:+521XXXXXXXXXX")
+    // Normalize to digits+country only so it validates correctly downstream.
+    // Also set senderPhone for the dedup buffer if not already set.
+    if (activeBooking.guest_phone) {
+      const rawPhone = String(activeBooking.guest_phone);
+      // Strip "whatsapp:" prefix if present, keep the + and digits
+      const cleaned = rawPhone.replace(/^whatsapp:/i, '').trim();
+      activeBooking.guest_phone = cleaned;
+      if (!senderPhone) senderPhone = cleaned;
+    }
+    // Freeze the pre-filled phone so extractBookingData never clears it.
+    // We pass it as a special key that mergeData won't overwrite with null.
+    const preFilled_guest_phone = activeBooking.guest_phone || null;
 
     let roomRates = {};
     try { roomRates = typeof roomRatesRaw === 'string' ? JSON.parse(roomRatesRaw) : roomRatesRaw; } catch (e) { roomRates = {}; }
@@ -1665,7 +1741,20 @@ ALWAYS respond in the EXACT same language the guest is writing in.
 DEFAULT LANGUAGE IS ENGLISH. If you cannot detect the guest's language clearly, respond in English.
 NEVER switch languages mid-conversation unless the guest switches first.
 NEVER default to Spanish — Spanish is only used when the guest writes in Spanish.
-This language rule applies to ALL messages: greetings, booking questions, confirmations, upsell offers, error messages.`;
+This language rule applies to ALL messages: greetings, booking questions, confirmations, upsell offers, error messages.
+
+TOUR & UPSELL OFFER RULE:
+After the guest confirms their check-in and check-out dates (and before you ask for their name), proactively mention 1-2 relevant tours or activities from the catalog naturally, not as a sales pitch.
+One brief line per tour: name + price. Example: "We also offer a cenote tour (MXN 850/person) and airport transfer (MXN 350 flat) if you are interested."
+Only mention tours that appear in the CATALOG. Never invent or suggest services not listed.
+If the guest has already asked about tours or declined, do not offer them again.
+
+TONE AND LENGTH RULE:
+This is WhatsApp, not email. Write like a helpful, warm person, not a form or a document.
+Avoid bullet-point lists with 6+ items. Avoid walls of text.
+When showing a booking summary, a clear 3-4 line breakdown is ideal.
+If you find yourself writing more than 6-7 lines, consider what is essential and trim the rest.
+This is a guideline, not a hard cap. A complete booking confirmation with costs needs enough space to be clear.`;
 
     let bookingContext = "";
 
@@ -1675,11 +1764,35 @@ This language rule applies to ALL messages: greetings, booking questions, confir
         .map(([k, v]) => `${k}: ${v}`)
         .join(", ");
 
+      // Build a partial cost breakdown for what we DO know, so Claude can
+      // show real numbers if the guest asks about price — never invent.
+      const cur = bookingFlow.currency || currency || "USD";
+      const knownNights = bookingFlow.data.check_in && bookingFlow.data.check_out
+        ? Math.ceil((new Date(bookingFlow.data.check_out) - new Date(bookingFlow.data.check_in)) / 86400000)
+        : null;
+      const knownRate = bookingFlow.data.room_type && roomRates
+        ? (roomRates[bookingFlow.data.room_type] || Object.values(roomRates)[0] || null)
+        : (Object.values(roomRates)[0] || null);
+      const knownRoomTotal = knownNights && knownRate ? knownNights * knownRate : null;
+      const knownAddOns = Array.isArray(bookingFlow.data.add_ons) ? bookingFlow.data.add_ons : [];
+      const addOnLines = knownAddOns.length > 0
+        ? knownAddOns.map(a => `  - ${a.name}: ${cur} ${a.subtotal ? a.subtotal.toLocaleString() : a.price}`).join("\n")
+        : null;
+      const partialBreakdown = knownRate
+        ? `\n\nCOST BREAKDOWN (use these exact numbers if the guest asks about price):
+  - Rate: ${cur} ${knownRate.toLocaleString()}/night${knownNights ? `
+  - Nights: ${knownNights}
+  - Room subtotal: ${cur} ${(knownNights * knownRate).toLocaleString()}` : " (nights not yet confirmed)"}${addOnLines ? `\n  - Extras:\n${addOnLines}` : ""}${knownRoomTotal ? `
+  - Total so far: ${cur} ${(knownRoomTotal + (knownAddOns.reduce((s, a) => s + (a.subtotal || 0), 0))).toLocaleString()}` : ""}
+RULE: If the guest asks about total cost and you DON'T have all the dates yet, give the nightly rate only — never estimate or project a total from partial data.
+RULE: ONLY use the numbers in this breakdown. NEVER calculate or invent amounts not shown here.`
+        : "";
+
       bookingContext = `
 
 BOOKING FLOW ACTIVE — GATHERING DATA:
 The guest is in the middle of making a booking. You have collected so far: ${fieldsCollected || "(nothing yet)"}.
-You still need to ask for: ${bookingFlow.next_question}.
+You still need to ask for: ${bookingFlow.next_question}.${partialBreakdown}
 
 CRITICAL: Your reply must naturally ask for the next field (${bookingFlow.next_question}). 
 Suggested phrasing: "${bookingFlow.suggested_reply}"
@@ -1698,21 +1811,38 @@ Keep the warm, friendly tone of the property.`;
         ? `\n\nExtras included:\n${addOns.map(a => `- ${a.name}: ${cur} ${a.subtotal.toLocaleString()}`).join("\n")}`
         : "";
 
+      // Build room line for the breakdown
+      const roomLine = bookingFlow.booking_data?.rooms?.[0]
+        ? `  - ${nights} night${nights > 1 ? "s" : ""} × ${cur} ${(bookingFlow.booking_data.rooms[0].price_per_night || 0).toLocaleString()}/night = ${cur} ${(bookingFlow.booking_data.rooms_subtotal || 0).toLocaleString()}`
+        : `  - Room subtotal: ${cur} ${(bookingFlow.booking_data?.rooms_subtotal || 0).toLocaleString()}`;
+
+      const addOnsSummary = addOns.length > 0
+        ? `\n${addOns.map(a => `  - ${a.name}: ${cur} ${(a.subtotal || 0).toLocaleString()}`).join("\n")}`
+        : "";
+
       bookingContext = `
 
 BOOKING FLOW ACTIVE — READY TO HOLD:
-The guest has provided all booking details. Total: ${cur} ${total ? total.toLocaleString() : "?"} for ${nights} nights.${addOnsBlock}
+The guest has provided all booking details. All numbers below are VERIFIED by the system — use them exactly.
 
-CRITICAL: Your reply should:
-1. Briefly summarize the booking (name, dates, room type, guests, total ${cur})
-2. If there are extras, mention them in the summary
-3. Say you are checking availability right now (the system will verify in seconds)
-4. Mention they will have 30 minutes to complete payment to lock the booking once availability is confirmed
-5. Do NOT say "you've secured the dates" yet — say "I'm checking availability" or "placing a hold"
-6. Do NOT include a payment link — the system will send it next
-7. Keep it warm and natural, 3-5 lines max.
-8. ALWAYS use the currency code ${cur}, never "$" alone or "USD" if currency is different.
-9. Respond in the guest's language (${language === "tl" ? "Filipino/Tagalog" : language === "es" ? "Spanish" : "English"}).`;
+BOOKING DETAILS:
+  - Guest: ${bookingFlow.booking_data?.guest_name || "—"}
+  - Room: ${bookingFlow.booking_data?.room_type || "—"}
+  - Dates: ${bookingFlow.booking_data?.check_in || "—"} → ${bookingFlow.booking_data?.check_out || "—"}
+  - Guests: ${bookingFlow.booking_data?.guests_count || "—"}
+${roomLine}${addOnsSummary}
+  - TOTAL: ${cur} ${total ? total.toLocaleString() : "?"}
+
+CRITICAL — YOUR REPLY MUST:
+1. Show the full booking summary with the exact numbers above (room cost, extras if any, TOTAL)
+2. Say you are checking availability right now
+3. Mention they will have 30 minutes to complete payment once availability is confirmed
+4. Do NOT say "you've secured the dates" yet
+5. Do NOT include a payment link — the system will send it in the next message
+6. Keep it warm and natural — a friendly confirmation, not a form
+7. ALWAYS use the currency code ${cur}, never "$" alone or "USD" if currency is different
+8. ONLY use the numbers provided above — NEVER recalculate or modify them
+9. Respond in the guest's language (${language === "tl" ? "Filipino/Tagalog" : language === "es" ? "Spanish" : "English"})`;
     }
 
     const fullSystemPrompt = conversationSummary
@@ -1784,6 +1914,9 @@ CRITICAL: Your reply should:
         ? { summary: conversationSummary, messages: updatedMessages }
         : updatedMessages
     );
+
+    // ── Fix 3: Mark as processed (dedup buffer) ──────────────────
+    markProcessed(senderPhone);
 
     return {
       statusCode: 200,
