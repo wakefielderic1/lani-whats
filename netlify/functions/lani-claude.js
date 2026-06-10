@@ -958,7 +958,7 @@ function detectLanguage(text) {
   const lower = text.toLowerCase();
 
   // Tagalog/Filipino markers — check first since some overlap with English
-  const tagalogMarkers = /\b(po|ako|gusto|magbook|anong|pwede|salamat|namin|kayo|sige|oo|hindi|ba|yung|nang|ng ng|itong|sino|paano|kumusta|mahal|libre|alin|paki|pakitagalog|pakisabi|pakiusap|maraming|dalawa|tatlo|apat|lima|araw|gabi|umaga|hapon|bukas|kahapon|ngayon|dito|doon|dito|nandito|nandoon|kailan|saan|bakit|mayroon|meron|wala|lahat|lang|din|rin|pala|talaga|syempre|syempre|naman|kasi|pero|tapos|saka|at|kung|para|sa|na|ng|mga)\b/i;
+  const tagalogMarkers = /\b(po|ako|gusto|magbook|anong|pwede|salamat|namin|kayo|sige|oo|hindi|ba|yung|nang|itong|sino|paano|kumusta|mahal|libre|alin|paki|maraming|dalawa|tatlo|apat|lima|araw|gabi|umaga|hapon|bukas|kahapon|ngayon|nandito|nandoon|kailan|saan|bakit|mayroon|meron|wala|lahat|talaga|syempre|naman|kasi|tapos|saka)\b/i;
   if (tagalogMarkers.test(lower)) return "tl";
 
   // Spanish markers
@@ -1706,12 +1706,16 @@ exports.handler = async (event) => {
       });
 
       // Pre-seed guest_phone from activeBooking if not already in extraction
-      if (activeBooking?.guest_phone && 
-          !activeBooking.guest_phone.startsWith("{{") &&
-          !activeBooking.guest_phone.includes("From") &&
-          !extraction.data.guest_phone) {
-        extraction.data.guest_phone = activeBooking.guest_phone;
-        console.log("[LANI] guest_phone seeded from activeBooking into extraction");
+      if (activeBooking?.guest_phone && !extraction.data.guest_phone) {
+        // Clean whatsapp: prefix if present (e.g. "whatsapp:+52155..." → "+52155...")
+        let rawPhone = activeBooking.guest_phone;
+        if (typeof rawPhone === "string") {
+          rawPhone = rawPhone.replace(/^whatsapp:/i, "").trim();
+          if (rawPhone.length >= 8 && !rawPhone.startsWith("{{")) {
+            extraction.data.guest_phone = rawPhone;
+            console.log("[LANI] guest_phone seeded from activeBooking into extraction:", rawPhone);
+          }
+        }
       }
 
       bookingFlow = await buildBookingFlowResponse({
