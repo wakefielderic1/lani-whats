@@ -1,7 +1,14 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v11
+// LANI CLAUDE BACKEND — v12
 // Changelog:
-//   v11 (Jun 2026):
+//   v12 (Jun 2026):
+//     - Fix greeting language when guest selects property with a number
+//       (now checks conversation history for language context)
+//     - Added CRITICAL RULE — NEVER INVENT POLICIES
+//       (prevents inventing early check-in, late check-out, complimentary offers)
+//     - Added CRITICAL RULE — UPSELLS STRICTLY FROM CATALOG
+//       (prevents confirming services not in the JSON catalog)
+// ═══════════════════════════════════════════════════════════════════
 //     - Language default changed to English (was Spanish)
 //     - detectLanguage() — added Tagalog/Filipino markers; default "en"
 //     - FIELD_QUESTIONS_TL — Tagalog booking questions added
@@ -1445,12 +1452,24 @@ exports.handler = async (event) => {
         const confirmedProperty = listToDetect.find(p => p.property_id === detected);
 
         if (confirmedProperty) {
+          // If current message is just a number or single character, try to detect
+          // language from conversation history instead
+          let greetingLang = preIdLanguage;
+          if (greetingLang === "en" && /^[\d\s]+$/.test(userMessage.trim())) {
+            try {
+              const parsedHist = JSON.parse(history);
+              const msgs = Array.isArray(parsedHist) ? parsedHist : (parsedHist.messages || []);
+              const userMsgs = msgs.filter(m => m.role === "user").map(m => m.content || "").join(" ");
+              if (userMsgs) greetingLang = detectLanguage(userMsgs);
+            } catch(e) {}
+          }
+
           const greetings = {
             en: `Hi! I'm LANI 👋, your virtual assistant for *${confirmedProperty.name}*. How can I help you today? 😊`,
             tl: `Kumusta! Ako si LANI 👋, ang inyong virtual assistant ng *${confirmedProperty.name}*. Paano kita matutulungan ngayon? 😊`,
             es: `¡Hola! Soy LANI 👋, tu asistente virtual de *${confirmedProperty.name}*. ¿En qué puedo ayudarte hoy? 😊`
           };
-          const confirmMsg = greetings[preIdLanguage] || greetings.en;
+          const confirmMsg = greetings[greetingLang] || greetings.en;
 
           const updatedMessages = [
             { role: "user", content: userMessage },
@@ -1612,6 +1631,22 @@ If a guest asks about something not covered here (room types, prices, amenities,
 NEVER invent, assume, or borrow details from other properties or your general knowledge.
 If a field is empty or not mentioned in this prompt, treat it as unknown — do not fill in the gap.
 This rule overrides everything else.
+
+CRITICAL RULE — NEVER INVENT POLICIES:
+NEVER offer, mention, or imply any policy not explicitly listed in this prompt. This includes:
+- Early check-in or late check-out (unless explicitly listed as available)
+- Free upgrades, complimentary services, or "courtesy" offerings of any kind
+- Discounts, promotions, or special rates not listed
+- Pet policies, children policies, smoking policies — unless explicitly stated
+If a guest asks about any of these, say: "I don't have that detail — I'll pass your question to the property team."
+NEVER use phrases like "as a courtesy" or "complimentary" for anything not explicitly in this prompt.
+
+CRITICAL RULE — UPSELLS STRICTLY FROM CATALOG:
+You may ONLY offer, confirm, or "note" extras that appear EXACTLY in the CATALOG JSON above.
+If a guest asks for a service NOT in the catalog (e.g. transport to a specific beach, custom tours, activities not listed):
+- Do NOT say "noted", "added", "I'll arrange that", or any phrase suggesting it was booked
+- Respond: "I don't have that listed as an available service — I'll pass your request to the property team and they'll follow up with you directly."
+NEVER confirm an add-on that does not exist in the catalog. Even if the guest insists.
 
 CRITICAL RULE — OWNER PRIVACY:
 NEVER share the owner's personal phone number, WhatsApp number, or any direct contact details with guests under any circumstances.
