@@ -1545,7 +1545,7 @@ exports.handler = async (event) => {
       return {
         statusCode: 200,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reply: null, buffered: true })
+        body: JSON.stringify({ reply: "Un momento, estoy procesando tu mensaje... 🙏", buffered: true })
       };
     }
 
