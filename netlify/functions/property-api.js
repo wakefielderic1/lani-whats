@@ -202,6 +202,36 @@ exports.handler = async (event) => {
 
     if (event.httpMethod === "POST") {
       const updates = JSON.parse(event.body || "{}");
+
+      // ── Cancelar HOLD desde el dashboard ──
+      if (updates.cancel_booking_code) {
+        const bookingCode = updates.cancel_booking_code;
+        // Find the row in Bookings sheet
+        const bRes = await sheets.spreadsheets.values.get({
+          spreadsheetId: SHEET_ID,
+          range: "Bookings!A:L",
+        });
+        const bRows = bRes.data.values || [];
+        let targetRow = null;
+        for (let i = 1; i < bRows.length; i++) {
+          if (bRows[i][0] === bookingCode && bRows[i][1] === PROPERTY_ID) {
+            targetRow = i + 1; // 1-indexed
+            break;
+          }
+        }
+        if (!targetRow) {
+          return { statusCode: 404, headers, body: JSON.stringify({ error: "Booking not found" }) };
+        }
+        // Update status to CANCELLED (column L = index 12, 1-indexed = 12)
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: SHEET_ID,
+          range: `Bookings!L${targetRow}`,
+          valueInputOption: "RAW",
+          requestBody: { values: [["CANCELLED"]] },
+        });
+        return { statusCode: 200, headers, body: JSON.stringify({ success: true, cancelled: bookingCode }) };
+      }
+
       await updateProperty(sheets, rowNum, updates);
       return {
         statusCode: 200, headers,
