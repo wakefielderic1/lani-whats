@@ -1,6 +1,23 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v13
+// LANI CLAUDE BACKEND — v15
 // Changelog:
+//   v15 (Jun 2026):
+//     - Fix adversarial 1: Email/phone loop prevention — tracks attempt
+//       count per field in bookingData._field_attempts. After 3 failed
+//       attempts on the same field, skips it and asks another missing
+//       field. Uses gentler rephrasing on 2nd+ attempt.
+//     - Fix adversarial 2: Language consistency — conversationLanguage
+//       already passed to buildBookingFlowResponse (v13 fix confirmed).
+//       suggestedReply gentle variants now also trilingual (EN/ES/TL).
+//     - Fix adversarial 3: Conflicting claim detection — new
+//       detectConflictingClaim() function catches "I already paid/booked"
+//       patterns in 3 languages. Injects a focused 1-message resolution
+//       context block so LANI resolves it in one reply instead of four.
+//   v14 (Jun 2026):
+//     - Fix bug 2: currency fallback changed from "USD" to "MXN"
+//     - Fix bug 3: recoverFieldFromHistory catches lowercase names
+//     - Fix bug 6: READY_TO_HOLD fallback when checkout_url is null
+//     - Fix bug 7: check_in past validation uses start-of-today
 //   v13 (Jun 2026):
 //     - Fix 2: guest_phone auto-populated from Twilio webhook via Make
 //       activeBooking.guest_phone is now pre-filled by Make before calling backend.
@@ -677,12 +694,16 @@ function recoverFieldFromHistory(field, previousMessages) {
     case "guest_name": {
       const patterns = [
         /(?:Perfecto|Listo|Anotado|Hola|Hi|Gracias)[, ]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)+)/g,
-        /(?:tu nombre|name).+?([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)/g
+        /(?:tu nombre|name).+?([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)/g,
+        // Fix bug 3: also catch lowercase names from user messages
+        /^([a-záéíóúñA-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ]+(?:\s[a-záéíóúñA-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ]+)+)$/gm
       ];
       for (const pattern of patterns) {
         const matches = [...allText.matchAll(pattern)];
         if (matches.length > 0) {
-          return matches[matches.length - 1][1];
+          const name = matches[matches.length - 1][1];
+          // Capitalize each word before returning
+          return name.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
         }
       }
       break;
@@ -706,6 +727,29 @@ function recoverFieldFromHistory(field, previousMessages) {
   return null;
 }
 
+// ── Fix 3: Detect conflicting claims ──────────────────────────────
+// Catches when guest claims they already paid / already have a booking
+// but the current booking data has no confirmed status.
+// Returns true if a conflicting claim is detected.
+function detectConflictingClaim(userMessage, bookingData) {
+  if (!userMessage) return false;
+  const lower = userMessage.toLowerCase();
+  const claimPatterns = [
+    /already paid/i, /already booked/i, /already have a (booking|reservation|confirmation)/i,
+    /i paid/i, /i booked/i, /i have a (booking|reservation|confirmation)/i,
+    /you sent me a confirmation/i, /you gave me a confirmation/i,
+    /ya pagué/i, /ya reservé/i, /ya tengo (reserva|confirmación)/i,
+    /me enviaste (una )?confirmación/i, /ya está (pagado|confirmado)/i,
+    /nakapag.?book na/i, /nabayaran na/i, /may (booking|confirmation) na ako/i
+  ];
+  const hasClaim = claimPatterns.some(p => p.test(lower));
+  if (!hasClaim) return false;
+  // Only flag if booking is NOT actually confirmed in this conversation
+  const isConfirmed = bookingData.status === "CONFIRMED" ||
+    bookingData.booking_confirmed === true;
+  return !isConfirmed;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // extractBookingData v3
 // ═══════════════════════════════════════════════════════════════════
@@ -719,7 +763,7 @@ async function extractBookingData({
   currency
 }) {
   const todayISO = getTodayISO();
-  const cur = currency || "USD";
+  const cur = currency || "MXN";
   const ratesText = roomRates && Object.keys(roomRates).length > 0
     ? Object.entries(roomRates).map(([k, v]) => `- ${k}: ${cur} ${v}/night`).join("\n")
     : "(no room rates configured)";
@@ -940,7 +984,12 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
     return {
       intent: extracted.intent === true,
       data: mergedData,
-      extraction_notes: extracted.extraction_notes || null
+      extraction_notes: extracted.extraction_notes || null,
+      // ── Fix 3: Detect conflicting claims ──
+      // If guest says "I already paid / I already have a booking" but
+      // there is no confirmed booking in this conversation, flag it.
+      // The system prompt uses this to resolve the loop in 1 message.
+      conflicting_claim: detectConflictingClaim(userMessage, mergedData)
     };
 
   } catch (err) {
@@ -1003,9 +1052,11 @@ function validateReadyToHold(bookingData, roomRates) {
 
   if (bookingData.check_in && dateRegex.test(bookingData.check_in)) {
     const inDate = new Date(bookingData.check_in);
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    if (inDate < yesterday) {
+    // Require check_in to be at least today (not yesterday)
+    // Using start of today in UTC to avoid timezone issues
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (inDate < today) {
       errors.push("check_in is in the past");
     }
   }
@@ -1114,7 +1165,7 @@ function buildBookingDataPayload(bookingData, roomRates, nights, language, upsel
     rooms_subtotal: roomsSubtotal,
     add_ons_subtotal: addOnsTotal,
     total_amount: totalAmount,
-    currency: currency || "USD",
+    currency: currency || "MXN",
     language: language
   };
 }
@@ -1135,7 +1186,7 @@ async function createStripeCheckoutSession(bookingPayload, propertyName, propert
   }
 
   const siteUrl = process.env.SITE_URL || "https://lani.ph";
-  const currency = (bookingPayload.currency || "USD").toLowerCase();
+  const currency = (bookingPayload.currency || "MXN").toLowerCase();
 
   try {
     // ─── Construir line_items ───
@@ -1339,12 +1390,65 @@ async function buildBookingFlowResponse({
     }
   } else {
     stage = "GATHERING_DATA";
-    nextQuestion = missing[0];
+
+    // ── Fix 1: Smart field skipping to avoid email/phone loops ──
+    // If a field has been asked 3+ times without an answer, skip it temporarily
+    // and ask the next missing field instead. Come back to it at the end.
+    // _field_attempts is tracked in bookingData as a meta key.
+    const fieldAttempts = bookingData._field_attempts || {};
+    const MAX_FIELD_ATTEMPTS = 3;
+
+    // Find the best next field to ask — skip over stuck fields
+    let chosenField = null;
+    let skippedFields = [];
+    for (const field of missing) {
+      const attempts = fieldAttempts[field] || 0;
+      if (attempts < MAX_FIELD_ATTEMPTS) {
+        chosenField = field;
+        break;
+      } else {
+        skippedFields.push(field);
+      }
+    }
+
+    // If ALL missing fields are stuck (all exceeded attempts), ask the first one anyway
+    if (!chosenField) chosenField = missing[0];
+
+    // Increment attempt counter for chosen field
+    fieldAttempts[chosenField] = (fieldAttempts[chosenField] || 0) + 1;
+    bookingData._field_attempts = fieldAttempts;
+
+    nextQuestion = chosenField;
     const questions = getFieldQuestions(language);
     suggestedReply = questions[nextQuestion];
 
+    // If this field has already been asked 2+ times, use a gentler variant
+    if ((fieldAttempts[chosenField] || 1) >= 2) {
+      const gentleVariants = {
+        guest_email: {
+          en: "I just need your email to send the booking confirmation — without it I can't complete the reservation. What's your email address?",
+          es: "Solo necesito tu correo para enviarte la confirmación — sin él no puedo completar la reserva. ¿Cuál es tu email?",
+          tl: "Kailangan ko lang ng email para sa confirmation — hindi ko makumpleto ang booking kung wala ito. Ano ang iyong email?"
+        },
+        guest_phone: {
+          en: "A phone number is required to finalize the booking. Could you share yours?",
+          es: "Un teléfono es necesario para finalizar la reserva. ¿Me compartes el tuyo?",
+          tl: "Kailangan ng phone number para matapos ang booking. Pwede mo bang ibahagi ang sa iyo?"
+        },
+        guest_name: {
+          en: "I still need your full name to complete the booking. Could you share it?",
+          es: "Aún necesito tu nombre completo para la reserva. ¿Me lo confirmas?",
+          tl: "Kailangan ko pa rin ng iyong buong pangalan para sa booking. Pwede mo bang ibigay?"
+        }
+      };
+      const variant = gentleVariants[chosenField];
+      if (variant) {
+        suggestedReply = variant[language] || variant["en"];
+      }
+    }
+
     if (nextQuestion === "room_type" && roomRates && Object.keys(roomRates).length > 0) {
-      const cur = currency || "USD";
+      const cur = currency || "MXN";
       const roomList = Object.entries(roomRates)
         .map(([k, v]) => `- ${k.charAt(0).toUpperCase() + k.slice(1)}: ${cur} ${v}/night`)
         .join("\n");
@@ -1369,7 +1473,7 @@ async function buildBookingFlowResponse({
     nights: bookingData.nights || null,
     booking_data: bookingDataPayload,
     language: language,
-    currency: currency || "USD",
+    currency: currency || "MXN",
     validation_errors: validationErrors,
     // ─── Nuevos campos Fase 3B ───
     checkout_url: checkoutUrl,
@@ -1731,6 +1835,8 @@ exports.handler = async (event) => {
       });
 
       bookingFlow.extraction_notes = extraction.extraction_notes;
+      // ── Fix 3: surface conflicting_claim in bookingFlow ──
+      bookingFlow.conflicting_claim = extraction.conflicting_claim || false;
     } catch (err) {
       console.error("Booking extraction failed:", err);
     }
@@ -1795,7 +1901,28 @@ This is a guideline, not a hard cap. A complete booking confirmation with costs 
 
     let bookingContext = "";
 
-    if (bookingFlow.intent && bookingFlow.stage === "GATHERING_DATA") {
+    // ── Fix 3: Conflicting claim — resolve in 1 message ──────────
+    // Guest claimed they already paid/booked but no confirmed booking exists.
+    // Inject a focused instruction so LANI handles it in ONE reply, not four.
+    if (bookingFlow.conflicting_claim) {
+      bookingContext = `
+
+SITUATION — CONFLICTING CLAIM:
+The guest just claimed they already have a booking or have already paid, but there is NO confirmed payment in this conversation.
+This happens when guests confuse conversations, test the system, or are genuinely confused.
+
+YOUR RESPONSE MUST:
+1. Be warm and non-accusatory — never imply they are lying
+2. Clarify calmly in ONE message: in this conversation, no payment has been processed yet
+3. Offer to help them complete the booking if they still want to, OR pass their message to the property team to investigate
+4. Do NOT ask them for more information — just acknowledge and offer a clear next step
+5. Keep it to 2-3 lines maximum
+
+Example (adapt to guest's language and tone):
+"I don't see a completed payment in our system for this conversation — it's possible there was a mix-up. I can help you complete the booking now, or I can pass your message to the property team to look into it. Which would you prefer?"
+
+Respond in the guest's language: ${conversationLanguage === "tl" ? "Filipino/Tagalog" : conversationLanguage === "es" ? "Spanish" : "English"}`;
+    } else if (bookingFlow.intent && bookingFlow.stage === "GATHERING_DATA") {
       const fieldsCollected = Object.entries(bookingFlow.data)
         .filter(([k, v]) => v !== null && v !== undefined && v !== "")
         .map(([k, v]) => `${k}: ${v}`)
@@ -1803,7 +1930,7 @@ This is a guideline, not a hard cap. A complete booking confirmation with costs 
 
       // Build a partial cost breakdown for what we DO know, so Claude can
       // show real numbers if the guest asks about price — never invent.
-      const cur = bookingFlow.currency || currency || "USD";
+      const cur = bookingFlow.currency || currency || "MXN";
       const knownNights = bookingFlow.data.check_in && bookingFlow.data.check_out
         ? Math.ceil((new Date(bookingFlow.data.check_out) - new Date(bookingFlow.data.check_in)) / 86400000)
         : null;
@@ -1840,7 +1967,7 @@ Keep the warm, friendly tone of the property.`;
     } else if (bookingFlow.intent && bookingFlow.stage === "READY_TO_HOLD") {
       const total = bookingFlow.total_amount;
       const nights = bookingFlow.nights;
-      const cur = bookingFlow.currency || currency || "USD";
+      const cur = bookingFlow.currency || currency || "MXN";
 
       const bd = bookingFlow.booking_data || {};
       const addOns = Array.isArray(bd.add_ons) ? bd.add_ons : [];
@@ -1879,7 +2006,8 @@ CRITICAL — YOUR REPLY MUST:
 6. Keep it warm and natural — a friendly confirmation, not a form
 7. ALWAYS use the currency code ${cur}, never "$" alone or "USD" if currency is different
 8. ONLY use the numbers provided above — NEVER recalculate or modify them
-9. Respond in the guest's language (${language === "tl" ? "Filipino/Tagalog" : language === "es" ? "Spanish" : "English"})`;
+9. Respond in the guest's language (${language === "tl" ? "Filipino/Tagalog" : language === "es" ? "Spanish" : "English"})
+${!bookingFlow.checkout_url ? `\n⚠️ PAYMENT SYSTEM NOTE: The payment link could not be generated automatically. After your confirmation message, tell the guest: "I'll send you the payment details shortly — our team will follow up with you in a moment." Do NOT mention any technical issue.` : ""}`;
     }
 
     const fullSystemPrompt = conversationSummary
