@@ -551,13 +551,15 @@ const FIELD_QUESTIONS_EN = {
 };
 
 const FIELD_QUESTIONS_TL = {
-  room_type: "Anong uri ng kwarto ang gusto mo?",
-  check_in: "Kailan ang iyong check-in date?",
-  check_out: "At kailan ang check-out?",
-  guests_count: "Ilang tao ang mananabí?",
-  guest_name: "Pwede mo bang ibigay ang iyong buong pangalan?",
-  guest_email: "Ano ang iyong email address? Kailangan ko ito para sa confirmation.",
-  guest_phone: "Pwede mo bang ibigay ang iyong phone number para makontak ka namin?"
+  // Frases naturales de Taglish basadas en conversaciones reales con filipinos.
+  // Evitamos Tagalog formal — usamos la mezcla natural que la gente usa al textear.
+  room_type: "Anong type ng room ang gusto mo?",
+  check_in: "Kailan kayo darating? 🗓️",
+  check_out: "At kailan kayo aalis?",
+  guests_count: "Ilan kayo?",                    // "mananabí" no existe — fix
+  guest_name: "Anong pangalan mo? (full name po)",
+  guest_email: "Anong email mo? Para mapadala ko ang confirmation.",
+  guest_phone: "May contact number ka ba?"
 };
 
 function getFieldQuestions(language) {
@@ -1547,17 +1549,17 @@ async function buildBookingFlowResponse({
         guest_email: {
           en: "I just need your email to send the booking confirmation — without it I can't complete the reservation. What's your email address?",
           es: "Solo necesito tu correo para enviarte la confirmación — sin él no puedo completar la reserva. ¿Cuál es tu email?",
-          tl: "Kailangan ko lang ng email para sa confirmation — hindi ko makumpleto ang booking kung wala ito. Ano ang iyong email?"
+          tl: "Email lang ang kulang — para mapadala ko ang confirmation at payment link. Anong email mo?"
         },
         guest_phone: {
           en: "A phone number is required to finalize the booking. Could you share yours?",
           es: "Un teléfono es necesario para finalizar la reserva. ¿Me compartes el tuyo?",
-          tl: "Kailangan ng phone number para matapos ang booking. Pwede mo bang ibahagi ang sa iyo?"
+          tl: "Contact number mo rin — para ma-complete na natin. May number ka ba?"
         },
         guest_name: {
           en: "I still need your full name to complete the booking. Could you share it?",
           es: "Aún necesito tu nombre completo para la reserva. ¿Me lo confirmas?",
-          tl: "Kailangan ko pa rin ng iyong buong pangalan para sa booking. Pwede mo bang ibigay?"
+          tl: "Pangalan mo lang ang kulang para ma-confirm na. Full name po?"
         }
       };
       const variant = gentleVariants[chosenField];
