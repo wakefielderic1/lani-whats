@@ -2080,10 +2080,27 @@ Example (adapt to guest's language and tone):
 
 Respond in the guest's language: ${conversationLanguage === "tl" ? "Filipino/Tagalog" : conversationLanguage === "es" ? "Spanish" : "English"}`;
     } else if (bookingFlow.intent && bookingFlow.stage === "GATHERING_DATA") {
-      const fieldsCollected = Object.entries(bookingFlow.data)
-        .filter(([k, v]) => v !== null && v !== undefined && v !== "")
-        .map(([k, v]) => `${k}: ${v}`)
-        .join(", ");
+      // Fix 2: Separar campos en dos listas — los que ya tenemos (confirmados)
+      // y los que faltan. Esto le da a Claude contexto explícito de qué NO
+      // debe volver a preguntar, incluso si el huésped acaba de hacer una
+      // corrección (cambio de fecha, número de personas, etc.).
+      const HUMAN_FIELD_NAMES = {
+        room_type: "room type", check_in: "check-in date", check_out: "check-out date",
+        guests_count: "number of guests", guest_name: "guest name",
+        guest_email: "email address", guest_phone: "phone number", add_ons: "extras/add-ons"
+      };
+
+      const collectedFields = Object.entries(bookingFlow.data)
+        .filter(([k, v]) => v !== null && v !== undefined && v !== "" && !k.startsWith("_"))
+        .map(([k, v]) => {
+          const label = HUMAN_FIELD_NAMES[k] || k;
+          const display = Array.isArray(v) ? (v.length > 0 ? v.map(a => a.name).join(", ") : null) : v;
+          return display ? `${label}: ${display}` : null;
+        })
+        .filter(Boolean);
+
+      const fieldsCollected = collectedFields.join(" | ");
+      const confirmedCount = collectedFields.length;
 
       // Build a partial cost breakdown for what we DO know, so Claude can
       // show real numbers if the guest asks about price — never invent.
@@ -2112,14 +2129,20 @@ RULE: ONLY use the numbers in this breakdown. NEVER calculate or invent amounts 
       bookingContext = `
 
 BOOKING FLOW ACTIVE — GATHERING DATA:
-The guest is in the middle of making a booking. You have collected so far: ${fieldsCollected || "(nothing yet)"}.
-You still need to ask for: ${bookingFlow.next_question}.${partialBreakdown}
+The guest is making a booking. Here is what the system has ALREADY CONFIRMED (${confirmedCount} field${confirmedCount !== 1 ? "s" : ""}):
+${fieldsCollected ? `✅ CONFIRMED: ${fieldsCollected}` : "(nothing confirmed yet)"}
 
-CRITICAL: Your reply must naturally ask for the next field (${bookingFlow.next_question}). 
+⚠️ CRITICAL MEMORY RULE — READ THIS CAREFULLY:
+The guest may have just made a CORRECTION (changed dates, number of guests, etc.).
+A correction updates ONE field. It NEVER erases the others.
+If the system shows a field as CONFIRMED above, it means the guest already provided it — DO NOT ask for it again under any circumstances, even after a correction.
+
+The ONLY field you need to ask for next is: ${bookingFlow.next_question}
 Suggested phrasing: "${bookingFlow.suggested_reply}"
-You may adapt the phrasing to sound natural in context, but MUST ask only for this one field.
-Do NOT confirm the booking yet. Do NOT mention payment yet. Just gather the next piece of info conversationally.
-Do NOT ask again for any field already listed in "collected so far".
+You may adapt the phrasing to sound natural, but ask ONLY for this one field.
+Do NOT mention any confirmed field as if it were missing.
+Do NOT confirm the booking yet. Do NOT mention payment yet.${partialBreakdown}
+
 Keep the warm, friendly tone of the property.`;
     } else if (bookingFlow.intent && bookingFlow.stage === "READY_TO_HOLD") {
       const total = bookingFlow.total_amount;
@@ -2164,6 +2187,8 @@ CRITICAL — YOUR REPLY MUST:
 7. ALWAYS use the currency code ${cur}, never "$" alone or "USD" if currency is different
 8. ONLY use the numbers provided above — NEVER recalculate or modify them
 9. Respond in the guest's language (${language === "tl" ? "Filipino/Tagalog" : language === "es" ? "Spanish" : "English"})
+${addOns.length > 0 ? `10. ⚠️ UPSELL NAMES — CRITICAL: When mentioning extras/add-ons in your reply, you MUST use the EXACT names listed above in the booking details. These are the official catalog names. DO NOT paraphrase, shorten, or use what the guest wrote — use only the exact name as shown above.
+    Confirmed extras: ${addOns.map(a => `"${a.name}"`).join(", ")}` : ""}
 ${!bookingFlow.checkout_url ? `\n⚠️ PAYMENT SYSTEM NOTE: The payment link could not be generated automatically. After your confirmation message, tell the guest: "I'll send you the payment details shortly — our team will follow up with you in a moment." Do NOT mention any technical issue.` : ""}`;
     }
 
