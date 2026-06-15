@@ -55,6 +55,51 @@ const MAX_HISTORY = 40;
 const SUMMARY_THRESHOLD = 30;
 const TIMEOUT_MS = 20000;
 
+// ═══════════════════════════════════════════════════════════════════
+// SECURITY — SHARED SECRET (endpoint auth)
+// ───────────────────────────────────────────────────────────────────
+// Protege este endpoint de ser llamado por terceros que descubran la URL.
+// Sin esto, cualquiera puede mandar peticiones y quemar la cuota de la
+// API de Claude (cada mensaje = 2-3 llamadas a Sonnet).
+//
+// CÓMO FUNCIONA:
+//   - Make debe mandar el header  x-lani-secret: <valor>
+//   - El valor debe coincidir con la env var LANI_SHARED_SECRET en Netlify.
+//
+// INTERRUPTOR (importante):
+//   - Mientras la env var REQUIRE_SECRET NO esté en "true", la validación
+//     está APAGADA y todo funciona como hoy (no rompe las pruebas).
+//   - Cuando ya agregaste el header en Make y probaste, pon REQUIRE_SECRET
+//     = "true" en Netlify para ACTIVAR la protección.
+//
+// PASOS PARA ACTIVAR (cuando estés listo):
+//   1. En Netlify → Site settings → Environment variables, crea:
+//        LANI_SHARED_SECRET = (una frase larga y aleatoria, ej. 40+ chars)
+//   2. En tu escenario de Make, en el módulo HTTP que llama a esta función,
+//      agrega un header:  Name: x-lani-secret   Value: (el mismo valor)
+//   3. Prueba que el bot siga respondiendo.
+//   4. Crea la env var  REQUIRE_SECRET = true   y vuelve a probar.
+// ═══════════════════════════════════════════════════════════════════
+function checkSharedSecret(event) {
+  // Si el interruptor no está en "true", no validamos nada (modo actual).
+  if (process.env.REQUIRE_SECRET !== "true") return { ok: true };
+
+  const expected = process.env.LANI_SHARED_SECRET;
+  // Si se pidió validar pero no hay secreto configurado, fallamos cerrado
+  // (más seguro) y dejamos rastro en el log para diagnosticar.
+  if (!expected) {
+    console.error("[LANI] REQUIRE_SECRET=true pero LANI_SHARED_SECRET no está configurado");
+    return { ok: false, reason: "server_misconfigured" };
+  }
+
+  // Headers en Netlify llegan en minúsculas; revisamos ambas por si acaso.
+  const headers = event.headers || {};
+  const provided = headers["x-lani-secret"] || headers["X-Lani-Secret"] || "";
+
+  if (provided && provided === expected) return { ok: true };
+  return { ok: false, reason: "unauthorized" };
+}
+
 // ─── MESSAGE BUFFER — Fix 3 ────────────────────────────────────────
 // Prevents duplicate processing when a guest sends 2-3 rapid messages.
 // Netlify Functions are stateless — deduplicates within same warm instance.
@@ -751,6 +796,76 @@ function detectConflictingClaim(userMessage, bookingData) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// B1 — PARSEO TOLERANTE DEL JSON DE EXTRACCIÓN
+// ───────────────────────────────────────────────────────────────────
+// Claude casi siempre devuelve JSON limpio, pero ~1-2% de las veces lo
+// envuelve en texto ("Here's the JSON: {...}") o deja un fence mal
+// cerrado. Esta función intenta varias estrategias antes de rendirse,
+// para no perder los datos que el huésped ya dio.
+// Devuelve un objeto con shape { intent, data, extraction_notes } o un
+// fallback seguro si de plano no se puede extraer nada.
+// ═══════════════════════════════════════════════════════════════════
+function extractBalancedJSON(str) {
+  // Encuentra el primer objeto {...} con llaves balanceadas, ignorando
+  // llaves que aparezcan dentro de strings.
+  const start = str.indexOf("{");
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < str.length; i++) {
+    const ch = str[i];
+
+    if (escape) { escape = false; continue; }
+    if (ch === "\\") { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        return str.slice(start, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function parseExtractionJSON(rawText) {
+  const fallback = { intent: false, data: {}, extraction_notes: "parse_failed" };
+  if (!rawText || typeof rawText !== "string") return fallback;
+
+  // Estrategia 1: limpiar fences de markdown y parsear directo.
+  let cleaned = rawText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) { /* sigue a la estrategia 2 */ }
+
+  // Estrategia 2: extraer el primer objeto {...} balanceado del texto.
+  const balanced = extractBalancedJSON(cleaned);
+  if (balanced) {
+    try {
+      return JSON.parse(balanced);
+    } catch (e) { /* sigue a la estrategia 3 */ }
+  }
+
+  // Estrategia 3: a veces vienen comas finales (trailing commas) que
+  // rompen JSON.parse. Las quitamos y reintentamos sobre el balanceado.
+  if (balanced) {
+    try {
+      const noTrailing = balanced.replace(/,(\s*[}\]])/g, "$1");
+      return JSON.parse(noTrailing);
+    } catch (e) { /* nos rendimos */ }
+  }
+
+  console.warn("[LANI] parseExtractionJSON: no se pudo parsear, usando fallback");
+  return fallback;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // extractBookingData v3
 // ═══════════════════════════════════════════════════════════════════
 async function extractBookingData({
@@ -945,9 +1060,13 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
     const data = await response.json();
     let text = data.content?.[0]?.text || "{}";
 
-    text = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-
-    const extracted = JSON.parse(text);
+    // ── B1: Parseo tolerante del JSON de extracción ──────────────────
+    // Antes: un solo JSON.parse. Si Claude devolvía texto alrededor del
+    // JSON, o un fence mal cerrado, todo el turno se perdía y el huésped
+    // tenía que repetir datos que ya había dado (mala UX).
+    // Ahora: limpiamos fences y, si el parseo directo falla, extraemos
+    // el primer objeto {...} balanceado del texto antes de rendirnos.
+    const extracted = parseExtractionJSON(text);
 
     const mergedData = { ...reconstructedBooking };
     for (const [key, value] of Object.entries(extracted.data || {})) {
@@ -1490,6 +1609,18 @@ exports.handler = async (event) => {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
 
+  // ── SECURITY: validar secreto compartido (ver checkSharedSecret arriba) ──
+  // Apagado mientras REQUIRE_SECRET !== "true" — no afecta el flujo actual.
+  const auth = checkSharedSecret(event);
+  if (!auth.ok) {
+    console.warn("[LANI] Petición rechazada:", auth.reason);
+    return {
+      statusCode: auth.reason === "server_misconfigured" ? 500 : 401,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ error: "Unauthorized" })
+    };
+  }
+
   try {
     let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw;
     let activeBookingRaw, roomRatesRaw, propertyName, upsellsRaw, currency;
@@ -1545,7 +1676,7 @@ exports.handler = async (event) => {
       return {
         statusCode: 200,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reply: "Un momento, estoy procesando tu mensaje... 🙏", buffered: true })
+        body: JSON.stringify({ reply: null, buffered: true })
       };
     }
 
@@ -1766,20 +1897,46 @@ exports.handler = async (event) => {
       previousMessages = [];
     }
 
-    const language = detectLanguage(userMessage);
+    let language = detectLanguage(userMessage);
 
-    // ── Fix: Detect conversation language from history when current message is ambiguous ──
-    // If current message is in English but conversation was in Spanish/Filipino,
-    // keep the conversation language for suggested_reply generation
-    let conversationLanguage = language;
-    if (language === "en" && previousMessages.length > 0) {
+    // ── B2: Idioma firme con mensajes cortos/ambiguos ────────────────
+    // Problema: mensajes como "ok", "si", "dale", "2", "👍" no tienen
+    // marcadores de idioma → detectLanguage() los manda a inglés por
+    // defecto. Si la conversación venía en español/tagalo, el huésped
+    // recibía la siguiente respuesta en inglés (se ve como bot tonto).
+    //
+    // Regla: si el mensaje actual es corto/ambiguo Y el historial ya
+    // estableció un idioma, NO cambiamos de idioma — mantenemos el de
+    // la conversación. Solo un mensaje con marcadores claros de otro
+    // idioma puede cambiarlo (el huésped switchea a propósito).
+    const trimmedMsg = (userMessage || "").trim();
+    const isShortOrAmbiguous =
+      trimmedMsg.length <= 4 ||                 // "ok", "si", "2"
+      /^[\d\s\p{Emoji}\p{P}]+$/u.test(trimmedMsg); // solo números/emojis/puntuación
+
+    // Idioma establecido por el historial (mira los últimos mensajes del huésped)
+    let historyLang = "en";
+    if (previousMessages.length > 0) {
       const recentUserMsgs = previousMessages
         .filter(m => m.role === "user")
         .slice(-5)
         .map(m => m.content || "")
         .join(" ");
-      const historyLang = detectLanguage(recentUserMsgs);
-      if (historyLang !== "en") conversationLanguage = historyLang;
+      historyLang = detectLanguage(recentUserMsgs);
+    }
+
+    // Si el mensaje es corto/ambiguo y el historial tiene un idioma claro,
+    // adoptamos el idioma del historial para TODO (incluye mensajes de error).
+    if (isShortOrAmbiguous && historyLang !== "en") {
+      language = historyLang;
+    }
+
+    // conversationLanguage: el idioma "fuerte" para generar respuestas.
+    // Si el mensaje actual cayó en inglés pero el historial era otro, usamos
+    // el del historial (mantiene continuidad aunque el mensaje sea neutro).
+    let conversationLanguage = language;
+    if (language === "en" && historyLang !== "en") {
+      conversationLanguage = historyLang;
     }
 
     // ── Fix: Pre-fill guest_phone from activeBooking before extraction ──
@@ -2065,7 +2222,14 @@ ${!bookingFlow.checkout_url ? `\n⚠️ PAYMENT SYSTEM NOTE: The payment link co
 
     let cleanReply = typeof assistantReply === 'string' ? assistantReply.trim() : String(assistantReply).trim();
     if (cleanReply.startsWith('[') || cleanReply.startsWith('{')) {
-      cleanReply = "Something went wrong on my end. Please try again.";
+      // B3: Antes este fallback siempre salía en inglés, aunque el huésped
+      // hablara español o tagalo — se sentía robótico y roto. Ahora respeta
+      // el idioma detectado y suena como Lani (cálida, no técnica).
+      cleanReply = language === "tl"
+        ? "Pasensya na, may na-miss ako doon 🌴 Pwede mo bang ulitin?"
+        : language === "es"
+        ? "Perdón, algo se me escapó ahí 🌴 ¿Me lo repites, por favor?"
+        : "Sorry, I missed that one 🌴 Could you say it again?";
     }
 
     const updatedMessages = [
