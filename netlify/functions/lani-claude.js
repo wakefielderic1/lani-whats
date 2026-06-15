@@ -216,7 +216,7 @@ ${messages.map(m => `${m.role}: ${m.content}`).join("\n")}`;
       "anthropic-version": "2023-06-01"
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 500,
       system: systemPrompt,
       messages: [{ role: "user", content: summaryPrompt }]
@@ -284,7 +284,7 @@ No explanation. No punctuation. No other text.`;
       "anthropic-version": "2023-06-01"
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 50,
       messages: [{ role: "user", content: detectionPrompt }]
     })
@@ -353,7 +353,7 @@ No explanation. No punctuation. Just the category.`;
         "anthropic-version": "2023-06-01"
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-sonnet-4-6",
         max_tokens: 20,
         messages: [{ role: "user", content: prompt }]
       })
@@ -1053,7 +1053,7 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
         "anthropic-version": "2023-06-01"
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-sonnet-4-6",
         max_tokens: 500,
         messages: [{ role: "user", content: prompt }]
       })
@@ -2216,7 +2216,7 @@ ${!bookingFlow.checkout_url ? `\n⚠️ PAYMENT SYSTEM NOTE: The payment link co
             "anthropic-version": "2023-06-01"
           },
           body: JSON.stringify({
-            model: "claude-sonnet-4-20250514",
+            model: "claude-sonnet-4-6",
             max_tokens: 1024,
             system: fullSystemPrompt,
             messages: messages
