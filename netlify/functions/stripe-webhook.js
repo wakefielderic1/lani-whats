@@ -21,7 +21,7 @@ function getStripe() {
   try {
     const Stripe = require("stripe");
     stripeModule = Stripe(process.env.STRIPE_SECRET_KEY, {
-      apiVersion: "2026-04-22.dahlia"
+      apiVersion: "2024-06-20"
     });
     return stripeModule;
   } catch (err) {
