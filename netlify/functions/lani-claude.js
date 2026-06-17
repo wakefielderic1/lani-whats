@@ -1084,6 +1084,20 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
       mergedData.add_ons = [];
     }
 
+    // ── Bug fix (Larra test): aggressive email capture ───────────
+    // Larra sent her email inside a longer sentence with a typo:
+    // "...My eadd is lctugano@gmail.com". Claude's extractor missed it and
+    // LANI looped asking for the email. This catches ANY email-shaped token
+    // in the CURRENT user message directly, regardless of surrounding text,
+    // typos in the word "email", or odd phrasing — and trusts it immediately.
+    if (!mergedData.guest_email && userMessage) {
+      const directEmail = String(userMessage).match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+      if (directEmail) {
+        mergedData.guest_email = directEmail[0];
+        console.log("[LANI] guest_email captured directly from current message:", directEmail[0]);
+      }
+    }
+
     const recoverableFields = ["guest_name", "guest_email", "guest_phone"];
     for (const field of recoverableFields) {
       if (!mergedData[field]) {
@@ -1626,6 +1640,7 @@ exports.handler = async (event) => {
   try {
     let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw;
     let activeBookingRaw, roomRatesRaw, propertyName, upsellsRaw, currency;
+    let bookingStatus, confirmedBookingCode;
 
     const contentType = event.headers["content-type"] || "";
 
@@ -1642,6 +1657,8 @@ exports.handler = async (event) => {
       propertyName      = params.get("propertyName") || "";
       upsellsRaw        = params.get("upsells") || "";
       currency          = params.get("currency") || "USD";
+      bookingStatus        = params.get("bookingStatus") || "";
+      confirmedBookingCode = params.get("confirmedBookingCode") || "";
     } else {
       const body = JSON.parse(event.body);
       systemPrompt      = body.systemPrompt || "";
@@ -1655,6 +1672,8 @@ exports.handler = async (event) => {
       propertyName      = body.propertyName || "";
       upsellsRaw        = body.upsells || "";
       currency          = body.currency || "USD";
+      bookingStatus        = body.bookingStatus || "";
+      confirmedBookingCode = body.confirmedBookingCode || "";
     }
 
     if (!userMessage) {
@@ -1663,6 +1682,24 @@ exports.handler = async (event) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ error: "Missing userMessage" })
       };
+    }
+
+    // ── LIMPIEZA DE MENSAJES CITADOS (botón "Responder" de WhatsApp) ──────
+    // Cuando el huésped usa el botón Responder, Twilio manda el mensaje así:
+    //   "> Anong full name mo po?\nEricamhel Bonilla"
+    // Las líneas que empiezan con ">" son la cita del mensaje anterior de Lani.
+    // Si no limpiamos esto, el extractor puede confundirse y no detectar
+    // correctamente lo que el huésped realmente escribió, causando que Lani
+    // repita preguntas que el huésped ya respondió.
+    // Solución: quitar todas las líneas que empiezan con "> " antes de procesar.
+    if (typeof userMessage === 'string' && userMessage.includes('\n')) {
+      const lines = userMessage.split('\n');
+      const cleanLines = lines.filter(line => !line.trimStart().startsWith('>'));
+      const cleaned = cleanLines.join('\n').trim();
+      // Solo reemplazamos si quedó algo después de limpiar (evitar mensaje vacío)
+      if (cleaned.length > 0) {
+        userMessage = cleaned;
+      }
     }
 
     // ── Fix 3: Message deduplication buffer ──────────────────────
@@ -1703,6 +1740,20 @@ exports.handler = async (event) => {
     // Freeze the pre-filled phone so extractBookingData never clears it.
     // We pass it as a special key that mergeData won't overwrite with null.
     const preFilled_guest_phone = activeBooking.guest_phone || null;
+
+    // ── POST-CONFIRMED awareness ─────────────────────────────────
+    // Make passes bookingStatus="CONFIRMED" + confirmedBookingCode when this
+    // conversation already has a completed booking in the Bookings sheet.
+    // Without this, LANI is "blind" to the fact the booking is done — it keeps
+    // asking for email, offering tours, and looping on "I already paid".
+    // We inject the status into activeBooking so the whole flow knows.
+    const normalizedStatus = (bookingStatus || "").trim().toUpperCase();
+    const isPostConfirmed = normalizedStatus === "CONFIRMED";
+    if (isPostConfirmed) {
+      activeBooking.status = "CONFIRMED";
+      activeBooking.booking_confirmed = true;
+      if (confirmedBookingCode) activeBooking.booking_code = confirmedBookingCode;
+    }
 
     let roomRates = {};
     try { roomRates = typeof roomRatesRaw === 'string' ? JSON.parse(roomRatesRaw) : roomRatesRaw; } catch (e) { roomRates = {}; }
@@ -1957,6 +2008,10 @@ exports.handler = async (event) => {
       temp_booking_code: null
     };
 
+    // Skip all booking extraction / HOLD / Stripe logic if the booking is
+    // already confirmed — there's nothing to gather or charge. The
+    // POST-CONFIRMED system prompt block handles the conversation instead.
+    if (!isPostConfirmed) {
     try {
       const extraction = await extractBookingData({
         userMessage,
@@ -1999,6 +2054,7 @@ exports.handler = async (event) => {
     } catch (err) {
       console.error("Booking extraction failed:", err);
     }
+    } // end if (!isPostConfirmed)
 
     const dataIntegrityRule = `
 
@@ -2060,10 +2116,60 @@ This is a guideline, not a hard cap. A complete booking confirmation with costs 
 
     let bookingContext = "";
 
-    // ── Fix 3: Conflicting claim — resolve in 1 message ──────────
+    // ═══════════════════════════════════════════════════════════════
+    // POST-CONFIRMED MODE — highest priority
+    // ═══════════════════════════════════════════════════════════════
+    // This conversation already has a CONFIRMED booking (Make told us so).
+    // LANI must behave like a calm post-sale assistant: confirm the booking
+    // is done, answer questions about the existing reservation, but NEVER try
+    // to add extras, take a new payment, or re-open the booking in this chat.
+    // This block REPLACES the old conflicting_claim handling for confirmed chats.
+    const langWord = conversationLanguage === "tl" ? "Filipino/Tagalog"
+      : conversationLanguage === "es" ? "Spanish" : "English";
+
+    if (isPostConfirmed) {
+      const codeLine = confirmedBookingCode
+        ? `The confirmed reservation code is: ${confirmedBookingCode}`
+        : `This conversation has a confirmed reservation.`;
+
+      bookingContext = `
+
+═══════════════════════════════════════════════
+SITUATION — BOOKING ALREADY CONFIRMED (CRITICAL)
+═══════════════════════════════════════════════
+${codeLine}
+The booking in THIS conversation is COMPLETE and PAID. It is locked. This is the source of truth — trust it completely, even if your message history doesn't show the payment step (the confirmation was processed by the system, not in this chat).
+
+HOW TO BEHAVE NOW:
+
+1. If the guest asks about THEIR existing reservation (check-in time, what's included, directions, amenities, what they booked):
+   → Answer normally and warmly using the property info. Be helpful.
+
+2. If the guest says "I already paid", "did you confirm it", "secure the dates", "is it confirmed":
+   → Reassure them in ONE message: their booking is confirmed and all set. Mention the reservation code if you have it. Do NOT say you can't see a payment. Do NOT loop. Example: "Yes! Your reservation ${confirmedBookingCode || ""} is confirmed and all set ✅ Everything's locked in — nothing else needed from you."
+
+3. If the guest wants to ADD something (a tour, airport transfer, an extra night, more guests):
+   → Explain warmly that this booking is already closed and you can't modify it from here. Give them TWO clear options: (a) message you again in a NEW chat to make a separate new booking, or (b) the property team can help with add-ons to the existing one. Do NOT show a tour menu. Do NOT offer to "add" it. Example: "Your reservation is already confirmed and locked, so I can't add the tour to it from here 😊 But you can message me again anytime to start a new booking, or the property team can add it to your existing one for you."
+
+4. If the guest wants to make a completely NEW booking:
+   → Tell them to message again fresh to start a new reservation. Example: "I'd love to help with a new booking! Just send me a new message and we'll start fresh 🌴"
+
+5. If the guest wants to CHANGE or CANCEL the confirmed booking:
+   → This is handled by the property team. Say you'll pass the message along. Do NOT promise a specific response time unless it is explicitly in the property info above.
+
+ABSOLUTE RULES IN THIS MODE:
+- NEVER ask for email, phone, or any booking field again — the booking is DONE.
+- NEVER show a payment link, tour menu, or price breakdown again.
+- NEVER say "I don't see a payment" — the booking IS confirmed, trust that.
+- NEVER invent response times, callbacks, or promises not in the property info.
+- Keep replies short, warm, and final. 2-3 lines.
+
+Respond in the guest's language: ${langWord}`;
+    }
+    // ── Conflicting claim (only when NOT already confirmed) ──────
     // Guest claimed they already paid/booked but no confirmed booking exists.
     // Inject a focused instruction so LANI handles it in ONE reply, not four.
-    if (bookingFlow.conflicting_claim) {
+    else if (bookingFlow.conflicting_claim) {
       bookingContext = `
 
 SITUATION — CONFLICTING CLAIM:
