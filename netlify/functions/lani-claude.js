@@ -55,6 +55,51 @@ const MAX_HISTORY = 40;
 const SUMMARY_THRESHOLD = 30;
 const TIMEOUT_MS = 20000;
 
+// ═══════════════════════════════════════════════════════════════════
+// SECURITY — SHARED SECRET (endpoint auth)
+// ───────────────────────────────────────────────────────────────────
+// Protege este endpoint de ser llamado por terceros que descubran la URL.
+// Sin esto, cualquiera puede mandar peticiones y quemar la cuota de la
+// API de Claude (cada mensaje = 2-3 llamadas a Sonnet).
+//
+// CÓMO FUNCIONA:
+//   - Make debe mandar el header  x-lani-secret: <valor>
+//   - El valor debe coincidir con la env var LANI_SHARED_SECRET en Netlify.
+//
+// INTERRUPTOR (importante):
+//   - Mientras la env var REQUIRE_SECRET NO esté en "true", la validación
+//     está APAGADA y todo funciona como hoy (no rompe las pruebas).
+//   - Cuando ya agregaste el header en Make y probaste, pon REQUIRE_SECRET
+//     = "true" en Netlify para ACTIVAR la protección.
+//
+// PASOS PARA ACTIVAR (cuando estés listo):
+//   1. En Netlify → Site settings → Environment variables, crea:
+//        LANI_SHARED_SECRET = (una frase larga y aleatoria, ej. 40+ chars)
+//   2. En tu escenario de Make, en el módulo HTTP que llama a esta función,
+//      agrega un header:  Name: x-lani-secret   Value: (el mismo valor)
+//   3. Prueba que el bot siga respondiendo.
+//   4. Crea la env var  REQUIRE_SECRET = true   y vuelve a probar.
+// ═══════════════════════════════════════════════════════════════════
+function checkSharedSecret(event) {
+  // Si el interruptor no está en "true", no validamos nada (modo actual).
+  if (process.env.REQUIRE_SECRET !== "true") return { ok: true };
+
+  const expected = process.env.LANI_SHARED_SECRET;
+  // Si se pidió validar pero no hay secreto configurado, fallamos cerrado
+  // (más seguro) y dejamos rastro en el log para diagnosticar.
+  if (!expected) {
+    console.error("[LANI] REQUIRE_SECRET=true pero LANI_SHARED_SECRET no está configurado");
+    return { ok: false, reason: "server_misconfigured" };
+  }
+
+  // Headers en Netlify llegan en minúsculas; revisamos ambas por si acaso.
+  const headers = event.headers || {};
+  const provided = headers["x-lani-secret"] || headers["X-Lani-Secret"] || "";
+
+  if (provided && provided === expected) return { ok: true };
+  return { ok: false, reason: "unauthorized" };
+}
+
 // ─── MESSAGE BUFFER — Fix 3 ────────────────────────────────────────
 // Prevents duplicate processing when a guest sends 2-3 rapid messages.
 // Netlify Functions are stateless — deduplicates within same warm instance.
@@ -513,13 +558,15 @@ const FIELD_QUESTIONS_EN = {
 };
 
 const FIELD_QUESTIONS_TL = {
-  room_type: "Anong uri ng kwarto ang gusto mo?",
-  check_in: "Kailan ang iyong check-in date?",
-  check_out: "At kailan ang check-out?",
-  guests_count: "Ilang tao ang mananabí?",
-  guest_name: "Pwede mo bang ibigay ang iyong buong pangalan?",
-  guest_email: "Ano ang iyong email address? Kailangan ko ito para sa confirmation.",
-  guest_phone: "Pwede mo bang ibigay ang iyong phone number para makontak ka namin?"
+  // Frases naturales de Taglish basadas en conversaciones reales con filipinos.
+  // Evitamos Tagalog formal — usamos la mezcla natural que la gente usa al textear.
+  room_type: "Anong type ng room ang gusto mo?",
+  check_in: "Kailan kayo darating? 🗓️",
+  check_out: "At kailan kayo aalis?",
+  guests_count: "Ilan kayo?",                    // "mananabí" no existe — fix
+  guest_name: "Anong pangalan mo? (full name po)",
+  guest_email: "Anong email mo? Para mapadala ko ang confirmation.",
+  guest_phone: "May contact number ka ba?"
 };
 
 function getFieldQuestions(language) {
@@ -758,6 +805,76 @@ function detectConflictingClaim(userMessage, bookingData) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// B1 — PARSEO TOLERANTE DEL JSON DE EXTRACCIÓN
+// ───────────────────────────────────────────────────────────────────
+// Claude casi siempre devuelve JSON limpio, pero ~1-2% de las veces lo
+// envuelve en texto ("Here's the JSON: {...}") o deja un fence mal
+// cerrado. Esta función intenta varias estrategias antes de rendirse,
+// para no perder los datos que el huésped ya dio.
+// Devuelve un objeto con shape { intent, data, extraction_notes } o un
+// fallback seguro si de plano no se puede extraer nada.
+// ═══════════════════════════════════════════════════════════════════
+function extractBalancedJSON(str) {
+  // Encuentra el primer objeto {...} con llaves balanceadas, ignorando
+  // llaves que aparezcan dentro de strings.
+  const start = str.indexOf("{");
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < str.length; i++) {
+    const ch = str[i];
+
+    if (escape) { escape = false; continue; }
+    if (ch === "\\") { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        return str.slice(start, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function parseExtractionJSON(rawText) {
+  const fallback = { intent: false, data: {}, extraction_notes: "parse_failed" };
+  if (!rawText || typeof rawText !== "string") return fallback;
+
+  // Estrategia 1: limpiar fences de markdown y parsear directo.
+  let cleaned = rawText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) { /* sigue a la estrategia 2 */ }
+
+  // Estrategia 2: extraer el primer objeto {...} balanceado del texto.
+  const balanced = extractBalancedJSON(cleaned);
+  if (balanced) {
+    try {
+      return JSON.parse(balanced);
+    } catch (e) { /* sigue a la estrategia 3 */ }
+  }
+
+  // Estrategia 3: a veces vienen comas finales (trailing commas) que
+  // rompen JSON.parse. Las quitamos y reintentamos sobre el balanceado.
+  if (balanced) {
+    try {
+      const noTrailing = balanced.replace(/,(\s*[}\]])/g, "$1");
+      return JSON.parse(noTrailing);
+    } catch (e) { /* nos rendimos */ }
+  }
+
+  console.warn("[LANI] parseExtractionJSON: no se pudo parsear, usando fallback");
+  return fallback;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // extractBookingData v3
 // ═══════════════════════════════════════════════════════════════════
 async function extractBookingData({
@@ -952,9 +1069,13 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
     const data = await response.json();
     let text = data.content?.[0]?.text || "{}";
 
-    text = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-
-    const extracted = JSON.parse(text);
+    // ── B1: Parseo tolerante del JSON de extracción ──────────────────
+    // Antes: un solo JSON.parse. Si Claude devolvía texto alrededor del
+    // JSON, o un fence mal cerrado, todo el turno se perdía y el huésped
+    // tenía que repetir datos que ya había dado (mala UX).
+    // Ahora: limpiamos fences y, si el parseo directo falla, extraemos
+    // el primer objeto {...} balanceado del texto antes de rendirnos.
+    const extracted = parseExtractionJSON(text);
 
     const mergedData = { ...reconstructedBooking };
     for (const [key, value] of Object.entries(extracted.data || {})) {
@@ -968,6 +1089,20 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
       mergedData.add_ons = extracted.data.add_ons;
     } else if (!mergedData.add_ons) {
       mergedData.add_ons = [];
+    }
+
+    // ── Bug fix (Larra test): aggressive email capture ───────────
+    // Larra sent her email inside a longer sentence with a typo:
+    // "...My eadd is lctugano@gmail.com". Claude's extractor missed it and
+    // LANI looped asking for the email. This catches ANY email-shaped token
+    // in the CURRENT user message directly, regardless of surrounding text,
+    // typos in the word "email", or odd phrasing — and trusts it immediately.
+    if (!mergedData.guest_email && userMessage) {
+      const directEmail = String(userMessage).match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+      if (directEmail) {
+        mergedData.guest_email = directEmail[0];
+        console.log("[LANI] guest_email captured directly from current message:", directEmail[0]);
+      }
     }
 
     const recoverableFields = ["guest_name", "guest_email", "guest_phone"];
@@ -1435,17 +1570,17 @@ async function buildBookingFlowResponse({
         guest_email: {
           en: "I just need your email to send the booking confirmation — without it I can't complete the reservation. What's your email address?",
           es: "Solo necesito tu correo para enviarte la confirmación — sin él no puedo completar la reserva. ¿Cuál es tu email?",
-          tl: "Kailangan ko lang ng email para sa confirmation — hindi ko makumpleto ang booking kung wala ito. Ano ang iyong email?"
+          tl: "Email lang ang kulang — para mapadala ko ang confirmation at payment link. Anong email mo?"
         },
         guest_phone: {
           en: "A phone number is required to finalize the booking. Could you share yours?",
           es: "Un teléfono es necesario para finalizar la reserva. ¿Me compartes el tuyo?",
-          tl: "Kailangan ng phone number para matapos ang booking. Pwede mo bang ibahagi ang sa iyo?"
+          tl: "Contact number mo rin — para ma-complete na natin. May number ka ba?"
         },
         guest_name: {
           en: "I still need your full name to complete the booking. Could you share it?",
           es: "Aún necesito tu nombre completo para la reserva. ¿Me lo confirmas?",
-          tl: "Kailangan ko pa rin ng iyong buong pangalan para sa booking. Pwede mo bang ibigay?"
+          tl: "Pangalan mo lang ang kulang para ma-confirm na. Full name po?"
         }
       };
       const variant = gentleVariants[chosenField];
@@ -1497,9 +1632,22 @@ exports.handler = async (event) => {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
 
+  // ── SECURITY: validar secreto compartido (ver checkSharedSecret arriba) ──
+  // Apagado mientras REQUIRE_SECRET !== "true" — no afecta el flujo actual.
+  const auth = checkSharedSecret(event);
+  if (!auth.ok) {
+    console.warn("[LANI] Petición rechazada:", auth.reason);
+    return {
+      statusCode: auth.reason === "server_misconfigured" ? 500 : 401,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ error: "Unauthorized" })
+    };
+  }
+
   try {
     let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw;
     let activeBookingRaw, roomRatesRaw, propertyName, upsellsRaw, currency;
+    let bookingStatus, confirmedBookingCode;
 
     const contentType = event.headers["content-type"] || "";
 
@@ -1516,6 +1664,8 @@ exports.handler = async (event) => {
       propertyName      = params.get("propertyName") || "";
       upsellsRaw        = params.get("upsells") || "";
       currency          = params.get("currency") || "USD";
+      bookingStatus        = params.get("bookingStatus") || "";
+      confirmedBookingCode = params.get("confirmedBookingCode") || "";
     } else {
       const body = JSON.parse(event.body);
       systemPrompt      = body.systemPrompt || "";
@@ -1529,6 +1679,8 @@ exports.handler = async (event) => {
       propertyName      = body.propertyName || "";
       upsellsRaw        = body.upsells || "";
       currency          = body.currency || "USD";
+      bookingStatus        = body.bookingStatus || "";
+      confirmedBookingCode = body.confirmedBookingCode || "";
     }
 
     if (!userMessage) {
@@ -1537,6 +1689,24 @@ exports.handler = async (event) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ error: "Missing userMessage" })
       };
+    }
+
+    // ── LIMPIEZA DE MENSAJES CITADOS (botón "Responder" de WhatsApp) ──────
+    // Cuando el huésped usa el botón Responder, Twilio manda el mensaje así:
+    //   "> Anong full name mo po?\nEricamhel Bonilla"
+    // Las líneas que empiezan con ">" son la cita del mensaje anterior de Lani.
+    // Si no limpiamos esto, el extractor puede confundirse y no detectar
+    // correctamente lo que el huésped realmente escribió, causando que Lani
+    // repita preguntas que el huésped ya respondió.
+    // Solución: quitar todas las líneas que empiezan con "> " antes de procesar.
+    if (typeof userMessage === 'string' && userMessage.includes('\n')) {
+      const lines = userMessage.split('\n');
+      const cleanLines = lines.filter(line => !line.trimStart().startsWith('>'));
+      const cleaned = cleanLines.join('\n').trim();
+      // Solo reemplazamos si quedó algo después de limpiar (evitar mensaje vacío)
+      if (cleaned.length > 0) {
+        userMessage = cleaned;
+      }
     }
 
     // ── Fix 3: Message deduplication buffer ──────────────────────
@@ -1552,7 +1722,7 @@ exports.handler = async (event) => {
       return {
         statusCode: 200,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reply: "Un momento, estoy procesando tu mensaje... 🙏", buffered: true })
+        body: JSON.stringify({ reply: null, buffered: true })
       };
     }
 
@@ -1577,6 +1747,20 @@ exports.handler = async (event) => {
     // Freeze the pre-filled phone so extractBookingData never clears it.
     // We pass it as a special key that mergeData won't overwrite with null.
     const preFilled_guest_phone = activeBooking.guest_phone || null;
+
+    // ── POST-CONFIRMED awareness ─────────────────────────────────
+    // Make passes bookingStatus="CONFIRMED" + confirmedBookingCode when this
+    // conversation already has a completed booking in the Bookings sheet.
+    // Without this, LANI is "blind" to the fact the booking is done — it keeps
+    // asking for email, offering tours, and looping on "I already paid".
+    // We inject the status into activeBooking so the whole flow knows.
+    const normalizedStatus = (bookingStatus || "").trim().toUpperCase();
+    const isPostConfirmed = normalizedStatus === "CONFIRMED";
+    if (isPostConfirmed) {
+      activeBooking.status = "CONFIRMED";
+      activeBooking.booking_confirmed = true;
+      if (confirmedBookingCode) activeBooking.booking_code = confirmedBookingCode;
+    }
 
     let roomRates = {};
     try { roomRates = typeof roomRatesRaw === 'string' ? JSON.parse(roomRatesRaw) : roomRatesRaw; } catch (e) { roomRates = {}; }
@@ -1773,20 +1957,46 @@ exports.handler = async (event) => {
       previousMessages = [];
     }
 
-    const language = detectLanguage(userMessage);
+    let language = detectLanguage(userMessage);
 
-    // ── Fix: Detect conversation language from history when current message is ambiguous ──
-    // If current message is in English but conversation was in Spanish/Filipino,
-    // keep the conversation language for suggested_reply generation
-    let conversationLanguage = language;
-    if (language === "en" && previousMessages.length > 0) {
+    // ── B2: Idioma firme con mensajes cortos/ambiguos ────────────────
+    // Problema: mensajes como "ok", "si", "dale", "2", "👍" no tienen
+    // marcadores de idioma → detectLanguage() los manda a inglés por
+    // defecto. Si la conversación venía en español/tagalo, el huésped
+    // recibía la siguiente respuesta en inglés (se ve como bot tonto).
+    //
+    // Regla: si el mensaje actual es corto/ambiguo Y el historial ya
+    // estableció un idioma, NO cambiamos de idioma — mantenemos el de
+    // la conversación. Solo un mensaje con marcadores claros de otro
+    // idioma puede cambiarlo (el huésped switchea a propósito).
+    const trimmedMsg = (userMessage || "").trim();
+    const isShortOrAmbiguous =
+      trimmedMsg.length <= 4 ||                 // "ok", "si", "2"
+      /^[\d\s\p{Emoji}\p{P}]+$/u.test(trimmedMsg); // solo números/emojis/puntuación
+
+    // Idioma establecido por el historial (mira los últimos mensajes del huésped)
+    let historyLang = "en";
+    if (previousMessages.length > 0) {
       const recentUserMsgs = previousMessages
         .filter(m => m.role === "user")
         .slice(-5)
         .map(m => m.content || "")
         .join(" ");
-      const historyLang = detectLanguage(recentUserMsgs);
-      if (historyLang !== "en") conversationLanguage = historyLang;
+      historyLang = detectLanguage(recentUserMsgs);
+    }
+
+    // Si el mensaje es corto/ambiguo y el historial tiene un idioma claro,
+    // adoptamos el idioma del historial para TODO (incluye mensajes de error).
+    if (isShortOrAmbiguous && historyLang !== "en") {
+      language = historyLang;
+    }
+
+    // conversationLanguage: el idioma "fuerte" para generar respuestas.
+    // Si el mensaje actual cayó en inglés pero el historial era otro, usamos
+    // el del historial (mantiene continuidad aunque el mensaje sea neutro).
+    let conversationLanguage = language;
+    if (language === "en" && historyLang !== "en") {
+      conversationLanguage = historyLang;
     }
 
     // ── Fix: Pre-fill guest_phone from activeBooking before extraction ──
@@ -1805,6 +2015,10 @@ exports.handler = async (event) => {
       temp_booking_code: null
     };
 
+    // Skip all booking extraction / HOLD / Stripe logic if the booking is
+    // already confirmed — there's nothing to gather or charge. The
+    // POST-CONFIRMED system prompt block handles the conversation instead.
+    if (!isPostConfirmed) {
     try {
       const extraction = await extractBookingData({
         userMessage,
@@ -1847,6 +2061,7 @@ exports.handler = async (event) => {
     } catch (err) {
       console.error("Booking extraction failed:", err);
     }
+    } // end if (!isPostConfirmed)
 
     const dataIntegrityRule = `
 
@@ -1908,10 +2123,60 @@ This is a guideline, not a hard cap. A complete booking confirmation with costs 
 
     let bookingContext = "";
 
-    // ── Fix 3: Conflicting claim — resolve in 1 message ──────────
+    // ═══════════════════════════════════════════════════════════════
+    // POST-CONFIRMED MODE — highest priority
+    // ═══════════════════════════════════════════════════════════════
+    // This conversation already has a CONFIRMED booking (Make told us so).
+    // LANI must behave like a calm post-sale assistant: confirm the booking
+    // is done, answer questions about the existing reservation, but NEVER try
+    // to add extras, take a new payment, or re-open the booking in this chat.
+    // This block REPLACES the old conflicting_claim handling for confirmed chats.
+    const langWord = conversationLanguage === "tl" ? "Filipino/Tagalog"
+      : conversationLanguage === "es" ? "Spanish" : "English";
+
+    if (isPostConfirmed) {
+      const codeLine = confirmedBookingCode
+        ? `The confirmed reservation code is: ${confirmedBookingCode}`
+        : `This conversation has a confirmed reservation.`;
+
+      bookingContext = `
+
+═══════════════════════════════════════════════
+SITUATION — BOOKING ALREADY CONFIRMED (CRITICAL)
+═══════════════════════════════════════════════
+${codeLine}
+The booking in THIS conversation is COMPLETE and PAID. It is locked. This is the source of truth — trust it completely, even if your message history doesn't show the payment step (the confirmation was processed by the system, not in this chat).
+
+HOW TO BEHAVE NOW:
+
+1. If the guest asks about THEIR existing reservation (check-in time, what's included, directions, amenities, what they booked):
+   → Answer normally and warmly using the property info. Be helpful.
+
+2. If the guest says "I already paid", "did you confirm it", "secure the dates", "is it confirmed":
+   → Reassure them in ONE message: their booking is confirmed and all set. Mention the reservation code if you have it. Do NOT say you can't see a payment. Do NOT loop. Example: "Yes! Your reservation ${confirmedBookingCode || ""} is confirmed and all set ✅ Everything's locked in — nothing else needed from you."
+
+3. If the guest wants to ADD something (a tour, airport transfer, an extra night, more guests):
+   → Explain warmly that this booking is already closed and you can't modify it from here. Give them TWO clear options: (a) message you again in a NEW chat to make a separate new booking, or (b) the property team can help with add-ons to the existing one. Do NOT show a tour menu. Do NOT offer to "add" it. Example: "Your reservation is already confirmed and locked, so I can't add the tour to it from here 😊 But you can message me again anytime to start a new booking, or the property team can add it to your existing one for you."
+
+4. If the guest wants to make a completely NEW booking:
+   → Tell them to message again fresh to start a new reservation. Example: "I'd love to help with a new booking! Just send me a new message and we'll start fresh 🌴"
+
+5. If the guest wants to CHANGE or CANCEL the confirmed booking:
+   → This is handled by the property team. Say you'll pass the message along. Do NOT promise a specific response time unless it is explicitly in the property info above.
+
+ABSOLUTE RULES IN THIS MODE:
+- NEVER ask for email, phone, or any booking field again — the booking is DONE.
+- NEVER show a payment link, tour menu, or price breakdown again.
+- NEVER say "I don't see a payment" — the booking IS confirmed, trust that.
+- NEVER invent response times, callbacks, or promises not in the property info.
+- Keep replies short, warm, and final. 2-3 lines.
+
+Respond in the guest's language: ${langWord}`;
+    }
+    // ── Conflicting claim (only when NOT already confirmed) ──────
     // Guest claimed they already paid/booked but no confirmed booking exists.
     // Inject a focused instruction so LANI handles it in ONE reply, not four.
-    if (bookingFlow.conflicting_claim) {
+    else if (bookingFlow.conflicting_claim) {
       bookingContext = `
 
 SITUATION — CONFLICTING CLAIM:
@@ -1930,10 +2195,27 @@ Example (adapt to guest's language and tone):
 
 Respond in the guest's language: ${conversationLanguage === "tl" ? "Filipino/Tagalog" : conversationLanguage === "es" ? "Spanish" : "English"}`;
     } else if (bookingFlow.intent && bookingFlow.stage === "GATHERING_DATA") {
-      const fieldsCollected = Object.entries(bookingFlow.data)
-        .filter(([k, v]) => v !== null && v !== undefined && v !== "")
-        .map(([k, v]) => `${k}: ${v}`)
-        .join(", ");
+      // Fix 2: Separar campos en dos listas — los que ya tenemos (confirmados)
+      // y los que faltan. Esto le da a Claude contexto explícito de qué NO
+      // debe volver a preguntar, incluso si el huésped acaba de hacer una
+      // corrección (cambio de fecha, número de personas, etc.).
+      const HUMAN_FIELD_NAMES = {
+        room_type: "room type", check_in: "check-in date", check_out: "check-out date",
+        guests_count: "number of guests", guest_name: "guest name",
+        guest_email: "email address", guest_phone: "phone number", add_ons: "extras/add-ons"
+      };
+
+      const collectedFields = Object.entries(bookingFlow.data)
+        .filter(([k, v]) => v !== null && v !== undefined && v !== "" && !k.startsWith("_"))
+        .map(([k, v]) => {
+          const label = HUMAN_FIELD_NAMES[k] || k;
+          const display = Array.isArray(v) ? (v.length > 0 ? v.map(a => a.name).join(", ") : null) : v;
+          return display ? `${label}: ${display}` : null;
+        })
+        .filter(Boolean);
+
+      const fieldsCollected = collectedFields.join(" | ");
+      const confirmedCount = collectedFields.length;
 
       // Build a partial cost breakdown for what we DO know, so Claude can
       // show real numbers if the guest asks about price — never invent.
@@ -1962,19 +2244,25 @@ RULE: ONLY use the numbers in this breakdown. NEVER calculate or invent amounts 
       bookingContext = `
 
 BOOKING FLOW ACTIVE — GATHERING DATA:
-The guest is in the middle of making a booking. You have collected so far: ${fieldsCollected || "(nothing yet)"}.
-You still need to ask for: ${bookingFlow.next_question}.${partialBreakdown}
+The guest is making a booking. Here is what the system has ALREADY CONFIRMED (${confirmedCount} field${confirmedCount !== 1 ? "s" : ""}):
+${fieldsCollected ? `✅ CONFIRMED: ${fieldsCollected}` : "(nothing confirmed yet)"}
 
-CRITICAL: Your reply must naturally ask for the next field (${bookingFlow.next_question}). 
+⚠️ CRITICAL MEMORY RULE — READ THIS CAREFULLY:
+The guest may have just made a CORRECTION (changed dates, number of guests, etc.).
+A correction updates ONE field. It NEVER erases the others.
+If the system shows a field as CONFIRMED above, it means the guest already provided it — DO NOT ask for it again under any circumstances, even after a correction.
+
+The ONLY field you need to ask for next is: ${bookingFlow.next_question}
 Suggested phrasing: "${bookingFlow.suggested_reply}"
-You may adapt the phrasing to sound natural in context, but MUST ask only for this one field.
-Do NOT confirm the booking yet. Do NOT mention payment yet. Just gather the next piece of info conversationally.
-Do NOT ask again for any field already listed in "collected so far".
+You may adapt the phrasing to sound natural, but ask ONLY for this one field.
+Do NOT mention any confirmed field as if it were missing.
+Do NOT confirm the booking yet. Do NOT mention payment yet.${partialBreakdown}
 
 IF THE GUEST CLAIMS THEY ALREADY PROVIDED THIS FIELD (e.g. "I already gave it", "ya te lo di", "naibigay ko na", "te lo dije"):
 - First, double-check the conversation above. If it IS there, use it — do NOT ask again.
 - If it is genuinely NOT in the conversation, do NOT accuse them and do NOT keep looping. Acknowledge warmly that it didn't come through on your end, and ask once, gently. Example: "Hmm, it didn't come through on my side — could you send it once more? 🙏"
 - Never re-ask the same field more than two times in a row. If after that it's still missing, move on and let them know the property team can finalize that detail.
+
 Keep the warm, friendly tone of the property.`;
     } else if (bookingFlow.intent && bookingFlow.stage === "READY_TO_HOLD") {
       const total = bookingFlow.total_amount;
@@ -2019,6 +2307,8 @@ CRITICAL — YOUR REPLY MUST:
 7. ALWAYS use the currency code ${cur}, never "$" alone or "USD" if currency is different
 8. ONLY use the numbers provided above — NEVER recalculate or modify them
 9. Respond in the guest's language (${language === "tl" ? "Filipino/Tagalog" : language === "es" ? "Spanish" : "English"})
+${addOns.length > 0 ? `10. ⚠️ UPSELL NAMES — CRITICAL: When mentioning extras/add-ons in your reply, you MUST use the EXACT names listed above in the booking details. These are the official catalog names. DO NOT paraphrase, shorten, or use what the guest wrote — use only the exact name as shown above.
+    Confirmed extras: ${addOns.map(a => `"${a.name}"`).join(", ")}` : ""}
 ${!bookingFlow.checkout_url ? `\n⚠️ PAYMENT SYSTEM NOTE: The payment link could not be generated automatically. After your confirmation message, tell the guest: "I'll send you the payment details shortly — our team will follow up with you in a moment." Do NOT mention any technical issue.` : ""}`;
     }
 
@@ -2077,7 +2367,14 @@ ${!bookingFlow.checkout_url ? `\n⚠️ PAYMENT SYSTEM NOTE: The payment link co
 
     let cleanReply = typeof assistantReply === 'string' ? assistantReply.trim() : String(assistantReply).trim();
     if (cleanReply.startsWith('[') || cleanReply.startsWith('{')) {
-      cleanReply = "Something went wrong on my end. Please try again.";
+      // B3: Antes este fallback siempre salía en inglés, aunque el huésped
+      // hablara español o tagalo — se sentía robótico y roto. Ahora respeta
+      // el idioma detectado y suena como Lani (cálida, no técnica).
+      cleanReply = language === "tl"
+        ? "Pasensya na, may na-miss ako doon 🌴 Pwede mo bang ulitin?"
+        : language === "es"
+        ? "Perdón, algo se me escapó ahí 🌴 ¿Me lo repites, por favor?"
+        : "Sorry, I missed that one 🌴 Could you say it again?";
     }
 
     const updatedMessages = [
