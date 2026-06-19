@@ -1624,6 +1624,101 @@ async function buildBookingFlowResponse({
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// FIX LATENCIA (Paso 2) — RESPUESTA CON PLANTILLA EN READY_TO_HOLD
+// El turno de confirmación hacía: extracción (Claude) + Stripe +
+// redacción (Claude) = ~10s, chocando con el límite de 10s de Netlify
+// y matando el envío del link de pago. Con plantilla, ese turno baja a
+// ~5-6s. Los números vienen YA verificados del booking_data — cero
+// riesgo de cálculo. Solo cambia QUIÉN redacta este único mensaje de
+// confirmación; el resto de mensajes de LANI sigue redactándolos Claude.
+// ═══════════════════════════════════════════════════════════════════
+function formatDateRangeLocalized(checkIn, checkOut, lang) {
+  const monthsEs = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"];
+  const monthsEn = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  // Taglish usa nombres de mes en inglés de forma natural
+  const months = lang === "es" ? monthsEs : monthsEn;
+  const fmt = (iso) => {
+    if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso || "";
+    const [y, m, d] = iso.split("-").map(Number);
+    return `${d} ${months[m - 1]} ${y}`;
+  };
+  if (checkIn && checkOut) return `${fmt(checkIn)} → ${fmt(checkOut)}`;
+  return fmt(checkIn || checkOut);
+}
+
+function buildReadyToHoldReply(bookingFlow) {
+  const bd = bookingFlow.booking_data || {};
+  const cur = bookingFlow.currency || bd.currency || "MXN";
+  const langRaw = bookingFlow.language || "en";
+  const lang = (langRaw === "es" || langRaw === "tl") ? langRaw : "en";
+  const hasLink = !!bookingFlow.checkout_url;
+
+  const money = (n) => `${cur} ${Number(n || 0).toLocaleString()}`;
+  const name = (bd.guest_name || "").split(/\s+/)[0] || bd.guest_name || "";
+  const room = (bd.rooms && bd.rooms[0] && bd.rooms[0].room_type) || "";
+  const roomsSubtotal = bd.rooms_subtotal || 0;
+  const total = bd.total_amount || bookingFlow.total_amount || 0;
+  const nights = bd.nights || bookingFlow.nights || 0;
+  const guests = bd.guests_count || 0;
+  const addOns = Array.isArray(bd.add_ons) ? bd.add_ons : [];
+  const dateRange = formatDateRangeLocalized(bd.check_in, bd.check_out, lang);
+
+  // Líneas de extras — usa los nombres EXACTOS del catálogo (ya enriquecidos)
+  const addOnLines = addOns.length > 0
+    ? "\n" + addOns.map(a => `➕ ${a.name}: ${money(a.subtotal)}`).join("\n")
+    : "";
+
+  if (lang === "es") {
+    const guestsLbl = `${guests} ${guests === 1 ? "huésped" : "huéspedes"}`;
+    const nightsLbl = `${nights} ${nights === 1 ? "noche" : "noches"}`;
+    const closing = hasLink
+      ? "Una vez confirme la disponibilidad, tendrás 30 minutos para completar el pago. ¡Ya casi! 🌴"
+      : "Te enviaré los datos de pago en un momento — nuestro equipo te dará seguimiento enseguida. 🌴";
+    return `¡Perfecto, ${name}! 😊 Déjame verificar la disponibilidad ahora mismo.
+
+Resumen de tu reserva:
+📅 ${dateRange}
+👥 ${guestsLbl} · ${nightsLbl}
+🏡 ${room}: ${money(roomsSubtotal)}${addOnLines}
+💰 *TOTAL: ${money(total)}*
+
+${closing}`;
+  }
+
+  if (lang === "tl") {
+    const guestsLbl = `${guests} ${guests === 1 ? "guest" : "guests"}`;
+    const closing = hasLink
+      ? "Pagkakumpirma ng availability, may 30 minutes ka para magbayad. Malapit na! 🌴"
+      : "Ipapadala ko sa iyo ang payment details shortly — susundan ka ng aming team sa ilang sandali. 🌴";
+    return `Perfect, ${name}! 😊 I-check ko lang ang availability ngayon.
+
+Eto ang summary ng booking mo:
+📅 ${dateRange}
+👥 ${guestsLbl} · ${nights} gabi
+🏡 ${room}: ${money(roomsSubtotal)}${addOnLines}
+💰 *TOTAL: ${money(total)}*
+
+${closing}`;
+  }
+
+  // English (default)
+  const guestsLbl = `${guests} ${guests === 1 ? "guest" : "guests"}`;
+  const nightsLbl = `${nights} ${nights === 1 ? "night" : "nights"}`;
+  const closing = hasLink
+    ? "Once availability is confirmed, you'll have 30 minutes to complete payment. Almost there! 🌴"
+    : "I'll send you the payment details shortly — our team will follow up with you in a moment. 🌴";
+  return `Perfect, ${name}! 😊 Let me check availability right now.
+
+Here's your booking summary:
+📅 ${dateRange}
+👥 ${guestsLbl} · ${nightsLbl}
+🏡 ${room}: ${money(roomsSubtotal)}${addOnLines}
+💰 *TOTAL: ${money(total)}*
+
+${closing}`;
+}
+
 // ─────────────────────────────────────────────────────────────────
 // HANDLER PRINCIPAL
 // ─────────────────────────────────────────────────────────────────
@@ -2122,6 +2217,7 @@ If you find yourself writing more than 6-7 lines, consider what is essential and
 This is a guideline, not a hard cap. A complete booking confirmation with costs needs enough space to be clear.`;
 
     let bookingContext = "";
+    let templatedReply = null; // Paso 2: si se setea, saltamos la 2ª llamada a Claude
 
     // ═══════════════════════════════════════════════════════════════
     // POST-CONFIRMED MODE — highest priority
@@ -2310,6 +2406,12 @@ CRITICAL — YOUR REPLY MUST:
 ${addOns.length > 0 ? `10. ⚠️ UPSELL NAMES — CRITICAL: When mentioning extras/add-ons in your reply, you MUST use the EXACT names listed above in the booking details. These are the official catalog names. DO NOT paraphrase, shorten, or use what the guest wrote — use only the exact name as shown above.
     Confirmed extras: ${addOns.map(a => `"${a.name}"`).join(", ")}` : ""}
 ${!bookingFlow.checkout_url ? `\n⚠️ PAYMENT SYSTEM NOTE: The payment link could not be generated automatically. After your confirmation message, tell the guest: "I'll send you the payment details shortly — our team will follow up with you in a moment." Do NOT mention any technical issue.` : ""}`;
+
+      // ── Paso 2 (latencia): armamos la confirmación con plantilla a partir de
+      // los números YA verificados. Esto evita la 2ª llamada a Claude en este
+      // turno y lo baja de ~10s a ~5-6s, dentro del límite de Netlify, para
+      // que el envío del link de pago no se pierda por timeout.
+      templatedReply = buildReadyToHoldReply(bookingFlow);
     }
 
     const fullSystemPrompt = conversationSummary
@@ -2324,6 +2426,12 @@ ${!bookingFlow.checkout_url ? `\n⚠️ PAYMENT SYSTEM NOTE: The payment link co
     const needsEscalation = detectEscalation(userMessage);
 
     let assistantReply;
+    if (templatedReply) {
+      // ── Paso 2 (latencia): ya tenemos la confirmación armada con números
+      // verificados. Saltamos la llamada a Claude para que el turno termine
+      // en ~5-6s (antes ~10s) y el link de pago no se pierda por timeout. ──
+      assistantReply = templatedReply;
+    } else {
     try {
       const response = await withTimeout(
         fetch(ANTHROPIC_API, {
@@ -2363,6 +2471,7 @@ ${!bookingFlow.checkout_url ? `\n⚠️ PAYMENT SYSTEM NOTE: The payment link co
           ? "Estoy teniendo dificultades técnicas. Por favor intenta de nuevo en un momento."
           : "I'm experiencing a technical issue. Please try again in a moment.";
       }
+    }
     }
 
     let cleanReply = typeof assistantReply === 'string' ? assistantReply.trim() : String(assistantReply).trim();
