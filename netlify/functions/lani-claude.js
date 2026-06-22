@@ -533,8 +533,13 @@ const BOOKING_FIELDS_ORDER = [
   "check_out",
   "guests_count",
   "guest_name",
-  "guest_email",
-  "guest_phone"
+  "guest_email"
+  // NOTE: guest_phone is intentionally NOT here. The phone always arrives from
+  // the WhatsApp webhook ({{1.From}}) and is pre-filled into the booking, so
+  // LANI must never ask the guest for it. Asking created a second, conflicting
+  // phone source (typed vs webhook) that could stall the booking before HOLD.
+  // The phone is still REQUIRED for READY_TO_HOLD — that check lives in
+  // validateReadyToHold(), which keeps verifying guest_phone is present.
 ];
 
 const FIELD_QUESTIONS_ES = {
@@ -1078,12 +1083,28 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
     const extracted = parseExtractionJSON(text);
 
     const mergedData = { ...reconstructedBooking };
+
+    // ── Phone source-of-truth lock ───────────────────────────────
+    // The guest's phone ALWAYS comes from the WhatsApp webhook ({{1.From}}),
+    // pre-filled into activeBooking → reconstructedBooking. That value has the
+    // correct country code (e.g. +5215540976918). If we let Claude's extractor
+    // overwrite it with a number the guest happened to type (e.g. "5540976918",
+    // no country code), the two sources clash and the booking can stall before
+    // READY_TO_HOLD. So: if the webhook already gave us a phone, it WINS — the
+    // extractor can never replace it.
+    const webhookPhone = reconstructedBooking.guest_phone || null;
+
     for (const [key, value] of Object.entries(extracted.data || {})) {
       if (key === "add_ons") continue;
+      // Never let the extractor overwrite the webhook-provided phone.
+      if (key === "guest_phone" && webhookPhone) continue;
       if (value !== null && value !== undefined && value !== "") {
         mergedData[key] = value;
       }
     }
+
+    // Guarantee the webhook phone is present no matter what.
+    if (webhookPhone) mergedData.guest_phone = webhookPhone;
 
     if (Array.isArray(extracted.data?.add_ons)) {
       mergedData.add_ons = extracted.data.add_ons;
