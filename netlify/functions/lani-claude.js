@@ -1,6 +1,23 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v15
+// LANI CLAUDE BACKEND — v16
 // Changelog:
+//   v16 (Jun 2026):
+//     - Raised MAX_HISTORY 40→100 and SUMMARY_THRESHOLD 30→80.
+//       Stopgap so the history-compression summary almost never fires
+//       during pilot conversations. The summary currently flattens
+//       structured booking_data into prose, which desyncs fields and
+//       makes LANI re-ask dates/guests/email on long conversations
+//       (observed in Taglish over-capacity test, Jun 22). Root-cause fix
+//       to summarizeHistory (preserve structured booking_data) tracked
+//       separately. This only reduces how often the bug can trigger.
+//     - Taglish-hardened recoverFieldFromHistory:
+//       * Name confirmation triggers extended to EN/TL (Noted, Perfect,
+//         Salamat, Sige, Opo, Got it, Thanks, Nice to meet you), with
+//         optional "po" after the trigger.
+//       * Added NAME_STOPWORDS guard. The bare-line name pattern was
+//         matching common Taglish/ES/EN two-word phrases ("sige po",
+//         "salamat po", "oo nga") as guest names — would have booked
+//         guests under names like "Sige Po". Now rejected.
 //   v15 (Jun 2026):
 //     - Fix adversarial 1: Email/phone loop prevention — tracks attempt
 //       count per field in bookingData._field_attempts. After 3 failed
@@ -51,8 +68,8 @@
 // ═══════════════════════════════════════════════════════════════════
 
 const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
-const MAX_HISTORY = 40;
-const SUMMARY_THRESHOLD = 30;
+const MAX_HISTORY = 100;
+const SUMMARY_THRESHOLD = 80;
 const TIMEOUT_MS = 20000;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -733,7 +750,42 @@ function formatAddOnLine(addOn, currency) {
 
 // ═══════════════════════════════════════════════════════════════════
 // FIX BUG A — RECUPERACIÓN DE DATOS DESDE HISTORIAL
+// v16: Taglish-hardened.
+//   - Name confirmation triggers extended to EN/TL (Noted, Perfect,
+//     Salamat, Sige, Opo, Got it, Thanks, Nice to meet you) so names
+//     confirmed in Taglish replies are recovered, not just Spanish ones.
+//   - The bare-line "lowercase name" pattern was matching common Taglish
+//     /ES/EN two-word phrases ("sige po", "salamat po", "oo nga") as if
+//     they were guest names. Added NAME_STOPWORDS guard: any candidate
+//     containing a stopword token is rejected. Prevents bookings under
+//     names like "Sige Po".
 // ═══════════════════════════════════════════════════════════════════
+
+// Tokens that must NEVER appear inside a recovered name. If a candidate
+// name contains any of these (case-insensitive, whole word), it's discarded.
+// Covers common Taglish, Spanish and English filler that shows up as
+// standalone 2-word messages and would otherwise be mistaken for a name.
+const NAME_STOPWORDS = new Set([
+  // Tagalog/Taglish
+  "po","opo","oo","hindi","sige","salamat","gusto","ako","kayo","namin",
+  "yung","nga","naman","kasi","talaga","meron","wala","pwede","paki",
+  "anong","kailan","saan","bakit","ilan","mahal","libre","araw","gabi",
+  "bukas","ngayon","kumusta","maganda","ayos","sira","tama","mali",
+  // Spanish
+  "hola","gracias","por","favor","quiero","reservar","noche","noches",
+  "personas","nombre","correo","telefono","teléfono","pagar","reserva",
+  "buenas","buenos","claro","listo","perfecto","anotado","si","sí","no",
+  // English
+  "hi","hello","hey","thanks","thank","you","yes","ok","okay","nice","to",
+  "meet","got","it","noted","perfect","name","email","phone","book","room",
+  "the","and","please","sure","done","added"
+]);
+
+function containsStopword(candidate) {
+  const tokens = candidate.toLowerCase().split(/\s+/);
+  return tokens.some(t => NAME_STOPWORDS.has(t.replace(/[^a-záéíóúñ]/gi, "")));
+}
+
 function recoverFieldFromHistory(field, previousMessages) {
   if (!previousMessages || previousMessages.length === 0) return null;
 
@@ -751,24 +803,41 @@ function recoverFieldFromHistory(field, previousMessages) {
 
   switch (field) {
     case "guest_name": {
+      // Confirmation-led patterns: LANI says "<trigger> [po,] <Name>".
+      // Triggers now include Taglish/English, with optional "po" after.
+      const TRIGGERS = "Perfecto|Perfect|Listo|Anotado|Noted|Hola|Hi|Hello|Hey|Gracias|Salamat|Thanks|Thank you|Nice to meet you|Sige|Opo|Got it|Welcome";
       const patterns = [
-        /(?:Perfecto|Listo|Anotado|Hola|Hi|Gracias)[, ]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)+)/g,
-        /(?:tu nombre|name).+?([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)/g,
-        // Fix bug 3: also catch lowercase names from user messages
+        new RegExp(
+          `(?:${TRIGGERS})[,! ]+(?:po[,! ]+)?([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)+)`,
+          "g"
+        ),
+        /(?:tu nombre|full name|name)\b.{0,20}?([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)/g,
+        // Bare-line name (user typed just their name on its own line).
+        // Guarded by NAME_STOPWORDS below to avoid Taglish false positives.
         /^([a-záéíóúñA-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ]+(?:\s[a-záéíóúñA-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ]+)+)$/gm
       ];
+
       for (const pattern of patterns) {
         const matches = [...allText.matchAll(pattern)];
-        if (matches.length > 0) {
-          const name = matches[matches.length - 1][1];
-          // Capitalize each word before returning
-          return name.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+        // Walk matches newest-first; return the first that passes the guard.
+        for (let i = matches.length - 1; i >= 0; i--) {
+          const candidate = matches[i][1];
+          if (!candidate) continue;
+          // Reject anything containing common filler words (Taglish/ES/EN).
+          if (containsStopword(candidate)) continue;
+          // Reject absurdly long "names" (likely a sentence that slipped through).
+          if (candidate.split(/\s+/).length > 4) continue;
+          return candidate
+            .split(" ")
+            .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+            .join(" ");
         }
       }
       break;
     }
 
     case "guest_email": {
+      // Language-agnostic: email format is the same in any language.
       const emailPattern = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
       const matches = allText.match(emailPattern);
       if (matches && matches.length > 0) return matches[matches.length - 1];
