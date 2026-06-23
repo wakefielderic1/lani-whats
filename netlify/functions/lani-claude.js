@@ -1,6 +1,21 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v18
+// LANI CLAUDE BACKEND — v19
 // Changelog:
+//   v19 (Jun 2026):
+//     - FIX email/name loop. The old _field_attempts counter never persisted
+//       between turns (it lived only inside buildBookingFlowResponse and was
+//       never sent back to Make/Sheets), so it reset to 0 every message and the
+//       loop guard never fired — LANI could ask for the same field forever.
+//       New approach: countTimesAskedInHistory() counts how many times LANI
+//       already asked for each field by scanning the conversation history
+//       (which DOES persist), across EN/ES/TL cue phrases. After MAX_ASKS (3)
+//       asks for a field with no answer, and once ALL missing fields are
+//       exhausted, the flow enters a new ESCALATE_MISSING_INFO stage: LANI
+//       stops asking, reassures the guest warmly, and hands off to the property
+//       team. While below the limit, re-asks use "didn't come through, mind
+//       resending?" wording instead of repeating the same flat question.
+//       Field selection now also prefers the least-asked missing field, so one
+//       stuck field never blocks progress on the others.
 //   v18 (Jun 2026):
 //     - ROOT-CAUSE FIX for guest_phone being re-asked (non-deterministic).
 //       Root cause: activeBooking was built entirely from module 26 (Bookings
@@ -810,6 +825,46 @@ function containsStopword(candidate) {
   return tokens.some(t => NAME_STOPWORDS.has(t.replace(/[^a-záéíóúñ]/gi, "")));
 }
 
+// ── Fix 2 (v19): Count how many times LANI already asked for a field ──
+// The old _field_attempts counter lived only inside buildBookingFlowResponse
+// and was never persisted back to Make/Sheets, so it reset to 0 every turn and
+// the anti-loop logic never actually fired. This counts real asks from the
+// conversation history (which DOES persist between turns), so the loop guard
+// works. We detect an "ask" by looking for field-specific cue phrases in
+// LANI's past assistant messages, across EN/ES/TL.
+const ASK_CUES = {
+  guest_email: [
+    /\bemail\b/i, /\bcorreo\b/i, /\be-?mail\b/i, /@/
+  ],
+  guest_phone: [
+    /\bphone\b/i, /\btel[eé]fono\b/i, /\bnumber\b/i, /\bn[uú]mero\b/i, /\bcontact\b/i
+  ],
+  guest_name: [
+    /\bnombre\b/i, /\bname\b/i, /\bpangalan\b/i
+  ]
+};
+
+function countTimesAskedInHistory(field, previousMessages) {
+  if (!previousMessages || previousMessages.length === 0) return 0;
+  const cues = ASK_CUES[field];
+  if (!cues) return 0;
+  let count = 0;
+  for (const m of previousMessages) {
+    if (m.role !== "assistant" || !m.content) continue;
+    const text = String(m.content);
+    // An assistant message counts as "asking for this field" if it contains
+    // a question mark AND at least one field cue. The question mark keeps us
+    // from counting confirmations like "Noted, your email is saved".
+    if (text.includes("?") && cues.some(rx => rx.test(text))) {
+      count++;
+    }
+  }
+  return count;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FIX BUG A — RECUPERACIÓN DE DATOS DESDE HISTORIAL
+// ═══════════════════════════════════════════════════════════════════
 function recoverFieldFromHistory(field, previousMessages) {
   if (!previousMessages || previousMessages.length === 0) return null;
 
@@ -1589,7 +1644,8 @@ async function buildBookingFlowResponse({
   propertyName,
   propertyId,
   ownerWhatsapp,
-  maxGuests
+  maxGuests,
+  previousMessages
 }) {
   const nights = calculateNights(bookingData.check_in, bookingData.check_out);
   if (nights) bookingData.nights = nights;
@@ -1670,59 +1726,78 @@ async function buildBookingFlowResponse({
   } else {
     stage = "GATHERING_DATA";
 
-    // ── Fix 1: Smart field skipping to avoid email/phone loops ──
-    // If a field has been asked 3+ times without an answer, skip it temporarily
-    // and ask the next missing field instead. Come back to it at the end.
-    // _field_attempts is tracked in bookingData as a meta key.
-    const fieldAttempts = bookingData._field_attempts || {};
-    const MAX_FIELD_ATTEMPTS = 3;
+    // ── Fix 2 (v19): History-based loop guard (replaces dead _field_attempts) ──
+    // The old _field_attempts counter never persisted between turns, so it reset
+    // every message and the loop guard never fired. We now count how many times
+    // LANI ALREADY asked for each field by reading the conversation history,
+    // which DOES persist. This makes the guard actually work.
+    const MAX_ASKS = 3; // after asking this many times, stop and escalate
 
-    // Find the best next field to ask — skip over stuck fields
-    let chosenField = null;
-    let skippedFields = [];
+    // How many times have we already asked for each STILL-missing field?
+    const askedCounts = {};
     for (const field of missing) {
-      const attempts = fieldAttempts[field] || 0;
-      if (attempts < MAX_FIELD_ATTEMPTS) {
-        chosenField = field;
-        break;
-      } else {
-        skippedFields.push(field);
-      }
+      askedCounts[field] = countTimesAskedInHistory(field, previousMessages);
     }
 
-    // If ALL missing fields are stuck (all exceeded attempts), ask the first one anyway
+    // Pick the next field to ask: prefer fields we've asked for the FEWEST
+    // times, so we don't hammer one stuck field while others wait. Among
+    // equals, preserve BOOKING_FIELDS_ORDER (missing is already in that order).
+    let chosenField = null;
+    let minAsked = Infinity;
+    for (const field of missing) {
+      if (askedCounts[field] < minAsked) {
+        minAsked = askedCounts[field];
+        chosenField = field;
+      }
+    }
     if (!chosenField) chosenField = missing[0];
 
-    // Increment attempt counter for chosen field
-    fieldAttempts[chosenField] = (fieldAttempts[chosenField] || 0) + 1;
-    bookingData._field_attempts = fieldAttempts;
+    // If EVERY remaining missing field has already been asked MAX_ASKS times,
+    // stop looping. Escalate to the property team instead of asking again —
+    // this is the hard exit that kills the email/name loop for good.
+    const allExhausted = missing.every(f => (askedCounts[f] || 0) >= MAX_ASKS);
+    if (allExhausted) {
+      stage = "ESCALATE_MISSING_INFO";
+      nextQuestion = null;
+      const stuckList = missing.join(", ");
+      suggestedReply = language === "tl"
+        ? "Wala problema! Ipapasa ko na lang sa property team ang booking mo, at sila na ang mag-co-confirm ng huling detalye sa iyo directly 🌴"
+        : language === "es"
+        ? "¡No te preocupes! Paso tu reserva al equipo de la propiedad y ellos confirman contigo el último detalle directamente 🌴"
+        : "No worries! I'll pass your booking to the property team and they'll confirm the last detail with you directly 🌴";
+      // Surface which fields are stuck for the prompt context / logs.
+      validationErrors = [`unresolved_after_${MAX_ASKS}_asks: ${stuckList}`];
+    } else {
+      const timesAskedChosen = askedCounts[chosenField] || 0;
+      nextQuestion = chosenField;
+      const questions = getFieldQuestions(language);
+      suggestedReply = questions[nextQuestion];
 
-    nextQuestion = chosenField;
-    const questions = getFieldQuestions(language);
-    suggestedReply = questions[nextQuestion];
-
-    // If this field has already been asked 2+ times, use a gentler variant
-    if ((fieldAttempts[chosenField] || 1) >= 2) {
-      const gentleVariants = {
-        guest_email: {
-          en: "I just need your email to send the booking confirmation — without it I can't complete the reservation. What's your email address?",
-          es: "Solo necesito tu correo para enviarte la confirmación — sin él no puedo completar la reserva. ¿Cuál es tu email?",
-          tl: "Email lang ang kulang — para mapadala ko ang confirmation at payment link. Anong email mo?"
-        },
-        guest_phone: {
-          en: "A phone number is required to finalize the booking. Could you share yours?",
-          es: "Un teléfono es necesario para finalizar la reserva. ¿Me compartes el tuyo?",
-          tl: "Contact number mo rin — para ma-complete na natin. May number ka ba?"
-        },
-        guest_name: {
-          en: "I still need your full name to complete the booking. Could you share it?",
-          es: "Aún necesito tu nombre completo para la reserva. ¿Me lo confirmas?",
-          tl: "Pangalan mo lang ang kulang para ma-confirm na. Full name po?"
+      // If we've already asked for this field at least once, escalate the
+      // wording: acknowledge the friction and ask differently (never repeat
+      // the exact same flat question — that's what makes guests feel ignored).
+      if (timesAskedChosen >= 1) {
+        const gentleVariants = {
+          guest_email: {
+            en: "Sometimes messages don't come through on my end — would you mind sending your email one more time? I need it for the confirmation 🙏",
+            es: "A veces los mensajes no me llegan bien — ¿me reenvías tu correo una vez más? Lo necesito para la confirmación 🙏",
+            tl: "Minsan hindi dumadating ang mensahe sa akin — pwede mo bang i-send ulit ang email mo? Kailangan ko para sa confirmation 🙏"
+          },
+          guest_phone: {
+            en: "A phone number is required to finalize the booking. Could you share yours?",
+            es: "Un teléfono es necesario para finalizar la reserva. ¿Me compartes el tuyo?",
+            tl: "Contact number mo rin — para ma-complete na natin. May number ka ba?"
+          },
+          guest_name: {
+            en: "I still need your full name to complete the booking — could you send it once more? 🙏",
+            es: "Aún necesito tu nombre completo para la reserva — ¿me lo reenvías una vez más? 🙏",
+            tl: "Pangalan mo lang ang kulang para ma-confirm na — pwede mo bang ulitin? 🙏"
+          }
+        };
+        const variant = gentleVariants[chosenField];
+        if (variant) {
+          suggestedReply = variant[language] || variant["en"];
         }
-      };
-      const variant = gentleVariants[chosenField];
-      if (variant) {
-        suggestedReply = variant[language] || variant["en"];
       }
     }
 
@@ -2324,7 +2399,8 @@ exports.handler = async (event) => {
         propertyName: propertyName || "this property",
         propertyId: propertyId || "",
         ownerWhatsapp: ownerWhatsapp || "",
-        maxGuests: maxGuests
+        maxGuests: maxGuests,
+        previousMessages: previousMessages
       });
 
       bookingFlow.extraction_notes = extraction.extraction_notes;
@@ -2487,6 +2563,24 @@ YOUR REPLY MUST:
 5. Do NOT say the property team might allow an exception — the limit is firm.
 6. Do NOT ask for name, email, or other booking fields right now — capacity must be resolved first.
 7. Keep it short and friendly, 2-3 lines max.
+
+Suggested phrasing (adapt to tone/language): "${bookingFlow.suggested_reply}"
+
+Respond in the guest's language: ${conversationLanguage === "tl" ? "Filipino/Tagalog" : conversationLanguage === "es" ? "Spanish" : "English"}`;
+    } else if (bookingFlow.intent && bookingFlow.stage === "ESCALATE_MISSING_INFO") {
+      // A field (usually email) has been asked the maximum number of times and
+      // still hasn't arrived. Stop asking. Hand off to the property team warmly.
+      bookingContext = `
+
+SITUATION — MISSING INFO, TIME TO HAND OFF (CRITICAL):
+You have already asked the guest several times for a missing detail (likely their email) and it still hasn't come through. Asking again will only frustrate them — the #1 thing that makes a guest feel ignored.
+
+YOUR REPLY MUST:
+1. STOP asking for the missing field. Do not ask for it again under any circumstance in this reply.
+2. Reassure them warmly that it's no problem.
+3. Tell them you'll pass their booking to the property team, who will confirm the last detail with them directly.
+4. Keep it short, warm, and final — 2 lines max. Do not list what's missing in a clinical way.
+5. Do NOT send a payment link. Do NOT say the booking is confirmed.
 
 Suggested phrasing (adapt to tone/language): "${bookingFlow.suggested_reply}"
 
