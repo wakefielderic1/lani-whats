@@ -1,6 +1,19 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v17
+// LANI CLAUDE BACKEND — v18
 // Changelog:
+//   v18 (Jun 2026):
+//     - ROOT-CAUSE FIX for guest_phone being re-asked (non-deterministic).
+//       Root cause: activeBooking was built entirely from module 26 (Bookings
+//       search: guest_phone + status=HOLD). For a NEW guest, module 26 returns
+//       no row, so every {{26.`x`}} chip is blank and the activeBooking JSON
+//       collapses — taking the {{1.From}} phone bundled inside it down too.
+//       Phone arrived only when the guest already had a HOLD; otherwise LANI
+//       re-asked for it ("Anong phone number mo po?").
+//       Fix: Make now sends a DEDICATED `guestPhone` = {{1.From}} field,
+//       independent of module 26 (so it always arrives). Backend reads it as
+//       the authoritative phone, overriding activeBooking. Falls back to the
+//       activeBooking phone if the dedicated field is missing/unrendered, and
+//       guards against unrendered "{{...}}" chips leaking in as literal values.
 //   v17 (Jun 2026):
 //     - HARD CAPACITY LIMIT. New `maxGuests` param (Make sends property
 //       max_guests = {{5.`7`}}). Two layers:
@@ -1866,7 +1879,7 @@ exports.handler = async (event) => {
   try {
     let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw;
     let activeBookingRaw, roomRatesRaw, propertyName, upsellsRaw, currency;
-    let bookingStatus, confirmedBookingCode, maxGuestsRaw;
+    let bookingStatus, confirmedBookingCode, maxGuestsRaw, guestPhoneRaw;
 
     const contentType = event.headers["content-type"] || "";
 
@@ -1886,6 +1899,7 @@ exports.handler = async (event) => {
       bookingStatus        = params.get("bookingStatus") || "";
       confirmedBookingCode = params.get("confirmedBookingCode") || "";
       maxGuestsRaw         = params.get("maxGuests") || "";
+      guestPhoneRaw        = params.get("guestPhone") || "";
     } else {
       const body = JSON.parse(event.body);
       systemPrompt      = body.systemPrompt || "";
@@ -1902,6 +1916,7 @@ exports.handler = async (event) => {
       bookingStatus        = body.bookingStatus || "";
       confirmedBookingCode = body.confirmedBookingCode || "";
       maxGuestsRaw         = body.maxGuests || "";
+      guestPhoneRaw        = body.guestPhone || "";
     }
 
     if (!userMessage) {
@@ -1930,12 +1945,30 @@ exports.handler = async (event) => {
       }
     }
 
+    // ── Fix 4 (v18): DEDICATED guestPhone — the authoritative phone source ──
+    // Make now sends guestPhone = {{1.From}} as its OWN field, independent of
+    // activeBooking. This matters because activeBooking is built from module 26
+    // (Bookings search: guest_phone + status=HOLD), which returns NOTHING for a
+    // new guest. When 26 is empty, every {{26.`x`}} chip is blank and the whole
+    // activeBooking JSON — including the phone that used to live inside it —
+    // collapses. The result was non-deterministic: phone arrived when the guest
+    // already had a HOLD, vanished when they didn't, so LANI re-asked for it.
+    // By taking the phone from its own webhook-backed field, it ALWAYS arrives.
+    let dedicatedPhone = null;
+    if (guestPhoneRaw && typeof guestPhoneRaw === "string") {
+      const cleaned = guestPhoneRaw.replace(/^whatsapp:/i, "").trim();
+      // Ignore unrendered Make chips (e.g. literal "{{1.From}}") and junk.
+      if (cleaned && !cleaned.startsWith("{{") && cleaned.replace(/\D/g, "").length >= 8) {
+        dedicatedPhone = cleaned;
+      }
+    }
+
     // ── Fix 3: Message deduplication buffer ──────────────────────
     // Extracts sender phone early (before full parsing) to check buffer.
-    let senderPhone = null;
+    let senderPhone = dedicatedPhone || null;
     try {
       const _ab = typeof activeBookingRaw === 'string' ? JSON.parse(activeBookingRaw) : activeBookingRaw;
-      senderPhone = (_ab && _ab.guest_phone) ? _ab.guest_phone : null;
+      if (!senderPhone) senderPhone = (_ab && _ab.guest_phone) ? _ab.guest_phone : null;
     } catch(e) {}
 
     if (isDuplicateMessage(senderPhone)) {
@@ -1954,17 +1987,24 @@ exports.handler = async (event) => {
     try { activeBooking = typeof activeBookingRaw === 'string' ? JSON.parse(activeBookingRaw) : activeBookingRaw; } catch (e) { activeBooking = {}; }
     if (!activeBooking || typeof activeBooking !== 'object') activeBooking = {};
 
-    // ── Fix 2: Normalize guest_phone from Twilio/Make ────────────
-    // Make now injects activeBooking.guest_phone = {{1.From}} (e.g. "whatsapp:+521XXXXXXXXXX")
-    // Normalize to digits+country only so it validates correctly downstream.
-    // Also set senderPhone for the dedup buffer if not already set.
-    if (activeBooking.guest_phone) {
+    // ── Fix 2 + Fix 4: Normalize guest_phone from Twilio/Make ────────────
+    // The dedicated guestPhone field (webhook-backed, always present) is the
+    // authoritative source. If it's available, it OVERRIDES whatever came in
+    // through activeBooking — which can be empty/broken for new guests.
+    if (dedicatedPhone) {
+      activeBooking.guest_phone = dedicatedPhone;
+    } else if (activeBooking.guest_phone) {
+      // Fallback (legacy path): clean the phone that arrived inside activeBooking.
       const rawPhone = String(activeBooking.guest_phone);
-      // Strip "whatsapp:" prefix if present, keep the + and digits
       const cleaned = rawPhone.replace(/^whatsapp:/i, '').trim();
-      activeBooking.guest_phone = cleaned;
-      if (!senderPhone) senderPhone = cleaned;
+      // Guard against an unrendered chip leaking in as a literal value.
+      if (cleaned && !cleaned.startsWith("{{")) {
+        activeBooking.guest_phone = cleaned;
+      } else {
+        delete activeBooking.guest_phone;
+      }
     }
+    if (activeBooking.guest_phone && !senderPhone) senderPhone = activeBooking.guest_phone;
     // Freeze the pre-filled phone so extractBookingData never clears it.
     // We pass it as a special key that mergeData won't overwrite with null.
     const preFilled_guest_phone = activeBooking.guest_phone || null;
