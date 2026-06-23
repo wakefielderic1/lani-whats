@@ -1,6 +1,17 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v16
+// LANI CLAUDE BACKEND — v17
 // Changelog:
+//   v17 (Jun 2026):
+//     - HARD CAPACITY LIMIT. New `maxGuests` param (Make sends property
+//       max_guests = {{5.`7`}}). Two layers:
+//       * buildBookingFlowResponse: new OVER_CAPACITY stage. If guests >
+//         maxGuests, the flow is blocked BEFORE gathering data or creating
+//         any hold/Stripe session, and LANI is told to ask the guest to
+//         adjust (warm but firm, EN/ES/TL).
+//       * validateReadyToHold: also rejects over-capacity as a safety net.
+//       Fail-open: if Make doesn't send maxGuests (null), the capacity check
+//       is skipped so valid bookings are never blocked by a missing cap.
+//       Fixes: LANI confirmed an 8-guest booking when max was 6 (Jun 23 test).
 //   v16 (Jun 2026):
 //     - Raised MAX_HISTORY 40→100 and SUMMARY_THRESHOLD 30→80.
 //       Stopgap so the history-compression summary almost never fires
@@ -1253,7 +1264,7 @@ function detectLanguage(text) {
 // ═══════════════════════════════════════════════════════════════════
 // FASE 3 — VALIDACIÓN ESTRICTA DE READY_TO_HOLD
 // ═══════════════════════════════════════════════════════════════════
-function validateReadyToHold(bookingData, roomRates) {
+function validateReadyToHold(bookingData, roomRates, maxGuests) {
   const errors = [];
 
   if (!bookingData.room_type) errors.push("room_type missing");
@@ -1263,6 +1274,14 @@ function validateReadyToHold(bookingData, roomRates) {
   if (!bookingData.guest_name) errors.push("guest_name missing");
   if (!bookingData.guest_email) errors.push("guest_email missing");
   if (!bookingData.guest_phone) errors.push("guest_phone missing");
+
+  // ── HARD CAPACITY LIMIT ──
+  // Block READY_TO_HOLD if guests exceed the property max. This is the
+  // safety net: even if the prompt lets an over-capacity request through,
+  // the system will NOT create a hold/Stripe session for it.
+  if (maxGuests && bookingData.guests_count && bookingData.guests_count > maxGuests) {
+    errors.push(`over_capacity:${bookingData.guests_count}>${maxGuests}`);
+  }
 
   const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
   if (bookingData.check_in && !dateRegex.test(bookingData.check_in)) {
@@ -1556,7 +1575,8 @@ async function buildBookingFlowResponse({
   currency,
   propertyName,
   propertyId,
-  ownerWhatsapp
+  ownerWhatsapp,
+  maxGuests
 }) {
   const nights = calculateNights(bookingData.check_in, bookingData.check_out);
   if (nights) bookingData.nights = nights;
@@ -1581,8 +1601,22 @@ async function buildBookingFlowResponse({
 
   if (!intent) {
     stage = "NONE";
+  } else if (maxGuests && bookingData.guests_count && bookingData.guests_count > maxGuests) {
+    // ── CAPACITY GATE (firm but warm) ──
+    // Guest requested more than the property allows. Block the booking flow
+    // entirely and ask them to adjust. We do NOT advance, do NOT create a hold,
+    // do NOT keep asking for other fields — capacity must be resolved first.
+    stage = "OVER_CAPACITY";
+    nextQuestion = "guests_count";
+    const g = bookingData.guests_count;
+    const m = maxGuests;
+    suggestedReply = language === "tl"
+      ? `Ay, pasensya na po! ð Ang max namin ay ${m} guests para sa buong bahay — hindi po namin kaya ang ${g}. Pwede po bang i-adjust natin sa ${m} or below? Gusto ko pa rin po kayong matulungan! ð´`
+      : language === "es"
+      ? `¡Ay, qué pena! ð Nuestro máximo es ${m} huéspedes para la casa completa, así que ${g} no lo podemos acomodar. ¿Lo ajustamos a ${m} o menos? ¡Con gusto te ayudo a reservar! ð´`
+      : `Ah, so sorry! ð Our max is ${m} guests for the whole home, so ${g} is a bit over. Could we adjust it to ${m} or fewer? I'd still love to get you booked! ð´`;
   } else if (missing.length === 0) {
-    const validation = validateReadyToHold(bookingData, roomRates);
+    const validation = validateReadyToHold(bookingData, roomRates, maxGuests);
 
     if (validation.valid) {
       stage = "READY_TO_HOLD";
@@ -1832,7 +1866,7 @@ exports.handler = async (event) => {
   try {
     let systemPrompt, userMessage, history, ownerWhatsapp, propertyId, propertiesListRaw;
     let activeBookingRaw, roomRatesRaw, propertyName, upsellsRaw, currency;
-    let bookingStatus, confirmedBookingCode;
+    let bookingStatus, confirmedBookingCode, maxGuestsRaw;
 
     const contentType = event.headers["content-type"] || "";
 
@@ -1851,6 +1885,7 @@ exports.handler = async (event) => {
       currency          = params.get("currency") || "USD";
       bookingStatus        = params.get("bookingStatus") || "";
       confirmedBookingCode = params.get("confirmedBookingCode") || "";
+      maxGuestsRaw         = params.get("maxGuests") || "";
     } else {
       const body = JSON.parse(event.body);
       systemPrompt      = body.systemPrompt || "";
@@ -1866,6 +1901,7 @@ exports.handler = async (event) => {
       currency          = body.currency || "USD";
       bookingStatus        = body.bookingStatus || "";
       confirmedBookingCode = body.confirmedBookingCode || "";
+      maxGuestsRaw         = body.maxGuests || "";
     }
 
     if (!userMessage) {
@@ -1952,6 +1988,16 @@ exports.handler = async (event) => {
     if (!roomRates || typeof roomRates !== 'object') roomRates = {};
 
     const upsellsCatalog = parseUpsellsCatalog(upsellsRaw);
+
+    // ── Capacity: parse maxGuests from Make ({{5.`7`}} = property max_guests) ──
+    // Hard cap used to block over-capacity bookings. If Make doesn't send it
+    // (or sends garbage), maxGuests stays null and the capacity check is skipped
+    // (fail-open — never blocks a valid booking just because the cap is missing).
+    let maxGuests = null;
+    if (maxGuestsRaw !== "" && maxGuestsRaw !== null && maxGuestsRaw !== undefined) {
+      const parsed = parseInt(String(maxGuestsRaw).replace(/\D/g, ""), 10);
+      if (!isNaN(parsed) && parsed > 0) maxGuests = parsed;
+    }
 
     // ─────────────────────────────────────────────────────────────
     // MODO IDENTIFICACIÓN — no hay propertyId aún
@@ -2237,7 +2283,8 @@ exports.handler = async (event) => {
         currency,
         propertyName: propertyName || "this property",
         propertyId: propertyId || "",
-        ownerWhatsapp: ownerWhatsapp || ""
+        ownerWhatsapp: ownerWhatsapp || "",
+        maxGuests: maxGuests
       });
 
       bookingFlow.extraction_notes = extraction.extraction_notes;
@@ -2378,6 +2425,30 @@ YOUR RESPONSE MUST:
 
 Example (adapt to guest's language and tone):
 "I don't see a completed payment in our system for this conversation — it's possible there was a mix-up. I can help you complete the booking now, or I can pass your message to the property team to look into it. Which would you prefer?"
+
+Respond in the guest's language: ${conversationLanguage === "tl" ? "Filipino/Tagalog" : conversationLanguage === "es" ? "Spanish" : "English"}`;
+    } else if (bookingFlow.intent && bookingFlow.stage === "OVER_CAPACITY") {
+      // Guest asked for more guests than the property allows. The system has
+      // already blocked the booking. LANI's job: communicate the limit warmly
+      // and firmly, and invite them to adjust. Never proceed, never "pass to team
+      // for an exception" as if it might be approved, never keep collecting fields.
+      const g = bookingFlow.data.guests_count;
+      const m = maxGuests;
+      bookingContext = `
+
+SITUATION — OVER CAPACITY (the guest wants more guests than allowed):
+The guest asked to book for ${g} guests, but this property's hard maximum is ${m} guests for the entire home. The system has BLOCKED this booking — it cannot proceed at ${g} guests under any circumstances.
+
+YOUR REPLY MUST:
+1. Be warm and a little apologetic — we don't want to scare them off, just set the limit kindly.
+2. State the max clearly: the whole home sleeps up to ${m} guests.
+3. Invite them to adjust: "Could we bring it down to ${m} or fewer?" and offer to continue the booking if they do.
+4. Do NOT proceed with the booking at ${g} guests.
+5. Do NOT say the property team might allow an exception — the limit is firm.
+6. Do NOT ask for name, email, or other booking fields right now — capacity must be resolved first.
+7. Keep it short and friendly, 2-3 lines max.
+
+Suggested phrasing (adapt to tone/language): "${bookingFlow.suggested_reply}"
 
 Respond in the guest's language: ${conversationLanguage === "tl" ? "Filipino/Tagalog" : conversationLanguage === "es" ? "Spanish" : "English"}`;
     } else if (bookingFlow.intent && bookingFlow.stage === "GATHERING_DATA") {
