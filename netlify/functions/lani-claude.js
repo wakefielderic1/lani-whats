@@ -1,6 +1,24 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v21
+// LANI CLAUDE BACKEND — v21.1
 // Changelog:
+//   v21.1 (Jul 2026): HOTFIX — false-positive guest name from recovery
+//     A live test created a HOLD booking with guest_name "Completo Para" —
+//     two words captured from LANI's OWN question "¿Me das tu nombre Completo
+//     Para continuar?". The v21 name-recovery patterns were scanning assistant
+//     text and matched question/brand words. Three-layer fix:
+//     1. Recovery scoping: the name-cue (#3), bare-line (#4) and broad (#5)
+//        patterns now scan USER text ONLY (the guest's name is always typed by
+//        the guest). Only the confirmation patterns (#1-2, where LANI echoes the
+//        real name after a trigger) still read assistant text.
+//     2. Stopwords expanded with question words (completo, para, continuar,
+//        nombre, correo...) and brand/property words (casa, frida, lani, hotel).
+//     3. NEW name-quality guard in validateReadyToHold(): blocks the hold/Stripe
+//        step if guest_name contains junk/brand/question tokens, is a single word
+//        (need first+last), or contains digits. On failure, LANI asks for the
+//        full name specifically instead of proceeding to payment.
+//     Verified: name recovery 4/4 real cases, 4/4 negative cases return null,
+//     validation 6/6 (real names pass; "Completo Para"/"Casa Frida"/1-word/
+//     digits blocked).
 //   v21 (Jul 2026): Multi-ambassador test audit fixes (Veronica/Ericamhel/Larra)
 //     - FIX #2 (name/email lost on date changes — "gave my name 4 times"):
 //       Hardened recoverFieldFromHistory() for guest_name. During collection the
@@ -871,7 +889,15 @@ const NAME_STOPWORDS = new Set([
   "available","availability","checking","check","booking","confirm",
   "confirmed","payment","transfer","airport","tour","cenotes","guest",
   "guests","night","nights","total","summary","date","dates","home",
-  "entire","ocean","view","persons","person","checkout","checkin"
+  "entire","ocean","view","persons","person","checkout","checkin",
+  // v21.1: words from LANI's own questions that caused a false-positive name
+  // ("¿Me das tu nombre Completo Para continuar?" → "Completo Para")
+  "completo","para","continuar","nombre","correo","electronico","electrónico",
+  "reservar","reservarlo","quiero","gracias","hola","bienvenido","bienvenida",
+  "full","complete","name","continue","email","address","reservation",
+  // v21.1: property/brand words — the hotel name is never the guest's name
+  "casa","frida","lani","merida","mérida","yucatan","yucatán","hotel",
+  "property","bienvenidoa"
 ]);
 
 function containsStopword(candidate) {
@@ -1030,8 +1056,17 @@ function recoverFieldFromHistory(field, previousMessages) {
 
       for (let p = 0; p < patterns.length; p++) {
         const pattern = patterns[p];
-        // For the broad pattern (index 4), prefer scanning user text first.
-        const texts = p === 4 ? [userText, assistantText] : [allText];
+        // v21.1 FIX — where each pattern is allowed to look:
+        //   Patterns 0-1 (confirmation): LANI echoes the REAL name after a
+        //     trigger ("Nice to meet you, Veronica") → safe on all text.
+        //   Pattern 2 (name-cue "tu nombre X"): DANGEROUS on assistant text
+        //     because LANI's own question "tu nombre Completo Para continuar"
+        //     matches → user text only.
+        //   Pattern 3 (bare-line): user types their name alone → user text only.
+        //   Pattern 4 (broad catch-all): the guest's name is always typed by
+        //     the guest → user text only. (Scanning assistant text captured the
+        //     hotel name "Casa Frida" and question words as names.)
+        const texts = (p <= 1) ? [allText] : [userText];
         for (const text of texts) {
           const matches = [...text.matchAll(pattern)];
           for (let i = matches.length - 1; i >= 0; i--) {
@@ -1544,6 +1579,36 @@ function validateReadyToHold(bookingData, roomRates, maxGuests) {
   if (!bookingData.guest_email) errors.push("guest_email missing");
   if (!bookingData.guest_phone) errors.push("guest_phone missing");
 
+  // ── v21.1: GUEST NAME QUALITY GUARD (final safety net before payment) ──
+  // A production bug created a booking named "Completo Para" — words captured
+  // from LANI's own question "¿tu nombre Completo Para continuar?". Existence
+  // alone is not enough; the name must not be junk. This blocks READY_TO_HOLD
+  // (and therefore Stripe) when the name is clearly not a real guest name.
+  if (bookingData.guest_name) {
+    const nameLower = String(bookingData.guest_name).toLowerCase().trim();
+    // Junk tokens that must never appear as a "name" — question words, brand.
+    const JUNK_NAME_TOKENS = new Set([
+      "completo","para","continuar","nombre","correo","electronico","electrónico",
+      "reservar","reservarlo","quiero","gracias","hola","bienvenido","bienvenida",
+      "full","complete","name","continue","email","address","reservation",
+      "casa","frida","lani","hotel","available","availability","checking",
+      "booking","confirm","payment","transfer","disponible","disponibilidad"
+    ]);
+    const nameTokens = nameLower.split(/\s+/).filter(Boolean);
+    const junkCount = nameTokens.filter(t =>
+      JUNK_NAME_TOKENS.has(t.replace(/[^a-záéíóúñ]/gi, ""))
+    ).length;
+    // If ANY token is a junk/brand/question word, or the name is a single word,
+    // or it contains digits, treat the name as invalid — do NOT proceed to hold.
+    if (junkCount > 0) {
+      errors.push("guest_name invalid (contains question/brand words)");
+    } else if (nameTokens.length < 2) {
+      errors.push("guest_name incomplete (need first and last name)");
+    } else if (/\d/.test(nameLower)) {
+      errors.push("guest_name invalid (contains digits)");
+    }
+  }
+
   // ── HARD CAPACITY LIMIT ──
   // Block READY_TO_HOLD if guests exceed the property max. This is the
   // safety net: even if the prompt lets an over-capacity request through,
@@ -1917,12 +1982,27 @@ async function buildBookingFlowResponse({
       console.warn("[LANI] READY_TO_HOLD validation failed:", validation.errors);
       stage = "GATHERING_DATA";
       validationErrors = validation.errors;
-      nextQuestion = "confirmation";
-      suggestedReply = language === "tl"
-        ? "Pwede mo bang kumpirmahin ang mga detalye ng iyong booking bago ko i-hold?"
-        : language === "es"
-        ? "¿Me confirmas los datos de tu reserva antes de apartarla?"
-        : "Could you confirm your booking details before I place the hold?";
+
+      // v21.1: If the specific problem is the guest name (missing/junk/incomplete),
+      // ask for the NAME clearly instead of a vague "confirm your details".
+      // This is what recovers gracefully from the "Completo Para" class of bug:
+      // the booking never reaches payment, and LANI asks for a real full name.
+      const nameProblem = validation.errors.find(e => e.includes("guest_name"));
+      if (nameProblem) {
+        nextQuestion = "guest_name";
+        suggestedReply = language === "tl"
+          ? "Para makumpleto ko ang booking, pakibigay ang iyong buong pangalan (first at last name) 🙏"
+          : language === "es"
+          ? "Para completar tu reserva, ¿me compartes tu nombre completo (nombre y apellido)? 🙏"
+          : "To complete your booking, could you share your full name (first and last name)? 🙏";
+      } else {
+        nextQuestion = "confirmation";
+        suggestedReply = language === "tl"
+          ? "Pwede mo bang kumpirmahin ang mga detalye ng iyong booking bago ko i-hold?"
+          : language === "es"
+          ? "¿Me confirmas los datos de tu reserva antes de apartarla?"
+          : "Could you confirm your booking details before I place the hold?";
+      }
     }
   } else {
     stage = "GATHERING_DATA";
@@ -3034,10 +3114,46 @@ ${!bookingFlow.checkout_url ? `\n⚠️ PAYMENT SYSTEM NOTE: The payment link co
     };
 
   } catch (err) {
+    // ── v21.1: Never leave the guest in silence ──────────────────────
+    // Any unexpected error that escaped the inner try/catch blocks used to
+    // return a raw 500 with a technical message. Make would then send nothing
+    // to the guest — a silent failure that feels like being ignored.
+    // Instead, return 200 with a warm fallback message in the guest's language,
+    // plus needsEscalation so the owner is alerted to follow up.
+    console.error("[LANI] Unhandled error in handler:", err && err.message, err && err.stack);
+
+    let fallbackLang = "en";
+    try {
+      // Best-effort language guess from the raw body so the message fits.
+      const bodyStr = typeof event.body === "string" ? event.body : "";
+      if (/\b(hola|gracias|reservar|disponible|habitaci|noche|cuánto|cuanto)\b/i.test(bodyStr)) {
+        fallbackLang = "es";
+      } else if (/\b(po|salamat|magbook|kwarto|pwede|kailan|magkano)\b/i.test(bodyStr)) {
+        fallbackLang = "tl";
+      }
+    } catch (_) { /* keep default en */ }
+
+    const fallbackReply = fallbackLang === "tl"
+      ? "Pasensya na po, may kaunting teknikal na problema ako ngayon 🙏 Ipapasa ko ang inyong mensahe sa property team at kokontakin nila kayo agad."
+      : fallbackLang === "es"
+      ? "Disculpa, estoy teniendo un pequeño problema técnico en este momento 🙏 Le paso tu mensaje al equipo y te contactarán en breve."
+      : "Sorry, I'm having a small technical issue right now 🙏 I'll pass your message to the property team and they'll follow up with you shortly.";
+
+    // NOTE: we intentionally do NOT send updatedHistory here. On an unexpected
+    // error we don't have a reliable merged history, and sending "[]" could make
+    // Make overwrite/erase the guest's existing conversation. Omitting it lets
+    // Make keep whatever history it already had for this guest.
     return {
-      statusCode: 500,
+      statusCode: 200,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: err.message })
+      body: JSON.stringify({
+        reply: fallbackReply,
+        needsEscalation: true,
+        escalationKeyword: "system_error",
+        detectedPropertyId: null,
+        bookingFlow: { intent: false, stage: "NONE", data: {}, missing_fields: [], next_question: null, booking_data: null, language: fallbackLang, validation_errors: null, checkout_url: null, stripe_session_id: null, temp_booking_code: null },
+        error_handled: true
+      })
     };
   }
 };
