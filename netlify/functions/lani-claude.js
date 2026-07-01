@@ -1,6 +1,19 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v21.1
+// LANI CLAUDE BACKEND — v21.2
 // Changelog:
+//   v21.2 (Jul 2026): Email re-ask experience polish
+//     Test (Ana Torres) showed LANI asking "what's your email?" three times
+//     when the guest changed dates twice WITHOUT answering the email in between.
+//     Not a recovery bug (the email was never given until the end — it recovers
+//     correctly once provided, verified 3/3). It was a TONE problem: three
+//     identical questions feel like nagging. Fix: added a bookingContext rule
+//     ("WHEN A CORRECTION INTERRUPTS AN UNANSWERED QUESTION") telling LANI to
+//     acknowledge the correction first, then re-ask the pending field with FRESH,
+//     varied wording each time — never three identical asks in a row.
+//     NOTE (separate, deferred): each date change created a NEW Bookings row +
+//     calendar event (KSXX/GNM3 as dead HOLDs, only JLO7 CONFIRMED). That is a
+//     Make/calendar lifecycle issue (update-in-place vs create-new), not a
+//     lani-claude.js fix — to be handled in Make with the multi-booking work.
 //   v21.1 (Jul 2026): HOTFIX — false-positive guest name from recovery
 //     A live test created a HOLD booking with guest_name "Completo Para" —
 //     two words captured from LANI's OWN question "¿Me das tu nombre Completo
@@ -2955,6 +2968,21 @@ IF THE GUEST CLAIMS THEY ALREADY PROVIDED THIS FIELD (e.g. "I already gave it", 
 - First, double-check the conversation above. If it IS there, use it — do NOT ask again.
 - If it is genuinely NOT in the conversation, do NOT accuse them and do NOT keep looping. Acknowledge warmly that it didn't come through on your end, and ask once, gently. Example: "Hmm, it didn't come through on my side — could you send it once more? 🙏"
 - Never re-ask the same field more than two times in a row. If after that it's still missing, move on and let them know the property team can finalize that detail.
+
+WHEN A CORRECTION INTERRUPTS AN UNANSWERED QUESTION (avoid feeling repetitive):
+Sometimes you ask for a field (e.g. the email), and instead of answering, the guest
+makes a correction (changes dates, adds an extra). You still need that field — but
+do NOT robotically repeat the exact same question. Acknowledge the correction FIRST,
+then re-ask the pending field in a FRESH, natural way. Vary the wording each time.
+Example flow:
+- You: "What's your email?"
+- Guest: "actually change it to July 20-25"
+- You: "Done, updated to July 20-25 ✅ — and to send your confirmation, what's the best email for you?"
+- Guest: "no wait, July 27-30"
+- You: "No problem, July 27-30 it is 🗓️ Just need your email and we're all set!"
+Notice the phrasing CHANGES each time and stays warm — never three identical
+"what's your email?" in a row. The goal: the guest should feel heard on the
+correction, not nagged about the same question.
 
 Keep the warm, friendly tone of the property.`;
     } else if (bookingFlow.intent && bookingFlow.stage === "READY_TO_HOLD") {
