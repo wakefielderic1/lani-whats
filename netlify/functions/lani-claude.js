@@ -1,6 +1,50 @@
 // ═══════════════════════════════════════════════════════════════════
-// LANI CLAUDE BACKEND — v19
+// LANI CLAUDE BACKEND — v21
 // Changelog:
+//   v21 (Jul 2026): Multi-ambassador test audit fixes (Veronica/Ericamhel/Larra)
+//     - FIX #2 (name/email lost on date changes — "gave my name 4 times"):
+//       Hardened recoverFieldFromHistory() for guest_name. During collection the
+//       name/email live ONLY in conversation history (Make's activeBooking passes
+//       them empty except phone), so on a date-change turn the extractor often
+//       returned name:null and recovery failed → LANI re-asked. Added 5 recovery
+//       patterns: (1) name after a trigger, (2) name mid-sentence before punctuation,
+//       (3) explicit name cue, (4) bare-line name, (5) BROAD capitalized proper-noun
+//       scan (user text first). All patterns anchored to line boundaries so they
+//       cannot swallow a following word (e.g. "Veronica Manalo July"). Guarded by an
+//       expanded NAME_STOPWORDS (added months EN/ES + assistant words like
+//       "available","checking","booking") to block false positives like
+//       "Available July". Verified: 4/4 real ambassador cases recovered, 3/3
+//       negative cases return null. Recovery now logs "[LANI] v21 recovered ...".
+//     - FIX #2 (extractor): reinforced the HANDLE CORRECTIONS rule to HIGHEST
+//       PRIORITY with the real production failures (Veronica name 4×, Ericamhel
+//       email 3×) and a per-field "does it appear in history? then keep it" check.
+//     - FIX #4 (LANI asks for phone): added a hard "NEVER ASK FOR THE PHONE" block
+//       to the GATHERING_DATA bookingContext — after the name the next field is the
+//       EMAIL, never the phone (which already comes from WhatsApp).
+//     - FIX #5 (promising availability before it's checked): added a dataIntegrityRule
+//       forbidding "that works!/those dates are available!" on date entry, since real
+//       availability is only verified at the hold step. LANI now acknowledges dates
+//       and moves on without asserting they're free.
+//     - OUT OF SCOPE (separate work): Bug #1 (unpaid HOLDs blocking the calendar —
+//       lives in Make/calendar, not here) and Bug #3 (payment link sometimes not
+//       arriving — needs calendar-block vs timeout investigation).
+//   v20 (Jun 2026):
+//     - FIX add-ons lost on corrections. When a guest added an extra (e.g.
+//       airport transfer) and then changed the date or guest count, the extra
+//       silently vanished from the booking total — the guest paid without what
+//       they'd added. (Veronica's test: added transfer, changed the date, paid
+//       1600 instead of 1950.) Root cause: the extractor returns add_ons as
+//       absolute state each turn, and on a date-change message it returns [],
+//       which the merge code used to write straight over the saved extras.
+//       Fix: an empty/absent add_ons NEVER erases existing extras — they're only
+//       removed on an EXPLICIT cancellation ("ya no quiero el transfer", etc.).
+//       Existing extras are recovered from the conversation history via
+//       recoverAddOnsFromHistory() (activeBooking from Make doesn't carry add_ons
+//       during collection), with cross-language concept matching so a Spanish
+//       catalog item is recognized even when LANI confirmed it in EN/TL.
+//       Incoming extras are merged (de-duped) with existing ones rather than
+//       replacing them. Also reinforced the extractor prompt to preserve
+//       previously-confirmed add_ons across corrections.
 //   v19 (Jun 2026):
 //     - FIX email/name loop. The old _field_attempts counter never persisted
 //       between turns (it lived only inside buildBookingFlowResponse and was
@@ -817,12 +861,75 @@ const NAME_STOPWORDS = new Set([
   // English
   "hi","hello","hey","thanks","thank","you","yes","ok","okay","nice","to",
   "meet","got","it","noted","perfect","name","email","phone","book","room",
-  "the","and","please","sure","done","added"
+  "the","and","please","sure","done","added",
+  // v21: months (EN + ES) — block "Available July" style false positives
+  "january","february","march","april","may","june","july","august",
+  "september","october","november","december",
+  "enero","febrero","marzo","abril","mayo","junio","julio","agosto",
+  "septiembre","setiembre","octubre","noviembre","diciembre",
+  // v21: common assistant/booking words that can look capitalized
+  "available","availability","checking","check","booking","confirm",
+  "confirmed","payment","transfer","airport","tour","cenotes","guest",
+  "guests","night","nights","total","summary","date","dates","home",
+  "entire","ocean","view","persons","person","checkout","checkin"
 ]);
 
 function containsStopword(candidate) {
   const tokens = candidate.toLowerCase().split(/\s+/);
   return tokens.some(t => NAME_STOPWORDS.has(t.replace(/[^a-záéíóúñ]/gi, "")));
+}
+
+// ── Fix (v20): Recover confirmed add-ons from conversation history ──
+// activeBooking (from Make) doesn't carry add_ons during the collection phase,
+// so when we need the "existing" extras to protect them from a correction that
+// wipes them, we reconstruct them from the conversation. Strategy: scan the
+// assistant's past messages for catalog item names that LANI acknowledged
+// adding (e.g. "added na ang airport transfer", "Got it, adding the cenotes
+// tour"). We only count an item as confirmed if an acknowledgement verb appears
+// in the same message as the catalog name, to avoid capturing items merely
+// mentioned or priced.
+function recoverAddOnsFromHistory(previousMessages, upsellsCatalog) {
+  if (!Array.isArray(previousMessages) || previousMessages.length === 0) return [];
+  if (!Array.isArray(upsellsCatalog) || upsellsCatalog.length === 0) return [];
+
+  const ackRx = /\b(added|agregad|agregu|añadid|noted|got it|sige|adding|i-add|na-add|nadagdag|confirmad|incluid|sumama|kasama na)\b/i;
+
+  // The catalog is in Spanish, but LANI acknowledges extras in the guest's
+  // language (e.g. "Airport Transfer"), so matching on the Spanish catalog name
+  // fails cross-language. Instead, derive concept keywords from each catalog
+  // item that hold across EN/ES/TL, and match those.
+  const conceptMap = upsellsCatalog.map(item => {
+    const n = (item.name || "").toLowerCase();
+    const keys = new Set();
+    // Pull meaningful tokens from the catalog name itself.
+    n.split(/[^a-záéíóúñ]+/i).forEach(tok => { if (tok.length >= 4) keys.add(tok); });
+    // Add common cross-language synonyms by concept.
+    if (/aeropuerto|airport|transfer|transporte/.test(n)) {
+      ["transfer","airport","aeropuerto","transporte"].forEach(k => keys.add(k));
+    }
+    if (/cenote/.test(n)) ["cenote","cenotes"].forEach(k => keys.add(k));
+    if (/chich[eé]n|itz[aá]/.test(n)) ["chichen","itza","itzá"].forEach(k => keys.add(k));
+    if (/uxmal/.test(n)) keys.add("uxmal");
+    if (/cocina|cooking|cook/.test(n)) ["cocina","cooking","cook"].forEach(k => keys.add(k));
+    if (/hacienda/.test(n)) keys.add("hacienda");
+    if (/centro|hist[oó]rico|walking|caminata/.test(n)) ["centro","walking","caminata","histórico","historico"].forEach(k => keys.add(k));
+    return { item, keys: [...keys] };
+  });
+
+  const found = [];
+  for (const m of previousMessages) {
+    if (m.role !== "assistant" || !m.content) continue;
+    const text = String(m.content);
+    if (!ackRx.test(text)) continue; // only messages acknowledging an addition
+    const lower = text.toLowerCase();
+    for (const { item, keys } of conceptMap) {
+      if (keys.some(k => lower.includes(k))) {
+        const already = found.find(f => (f.name || "").toLowerCase() === item.name.toLowerCase());
+        if (!already) found.push({ name: item.name, quantity: null, hours: null });
+      }
+    }
+  }
+  return found;
 }
 
 // ── Fix 2 (v19): Count how many times LANI already asked for a field ──
@@ -882,34 +989,63 @@ function recoverFieldFromHistory(field, previousMessages) {
 
   switch (field) {
     case "guest_name": {
-      // Confirmation-led patterns: LANI says "<trigger> [po,] <Name>".
-      // Triggers now include Taglish/English, with optional "po" after.
-      const TRIGGERS = "Perfecto|Perfect|Listo|Anotado|Noted|Hola|Hi|Hello|Hey|Gracias|Salamat|Thanks|Thank you|Nice to meet you|Sige|Opo|Got it|Welcome";
+      // ── v21 hardening ────────────────────────────────────────────
+      // Bug (Veronica/Ericamhel tests): on a DATE-CHANGE turn, the extractor
+      // often returned guest_name:null and these patterns failed to recover
+      // the name from history, so LANI re-asked ("gave my name 4 times").
+      // Root cause: the name was frequently given INSIDE a sentence
+      // ("Okay paki add. Veronica Manalo") or LANI confirmed it with wording
+      // the old triggers didn't cover. Fix: add (a) confirmation patterns where
+      // LANI echoes the name mid-sentence, and (b) a broad "capitalized 2-3 word
+      // proper-noun" scan over BOTH user and assistant text, newest-first,
+      // stopword-guarded. This makes recovery deterministic instead of relying
+      // on the extractor to "remember" each turn.
+      const TRIGGERS = "Perfecto|Perfect|Listo|Anotado|Noted|Hola|Hi|Hello|Hey|Gracias|Salamat|Thanks|Thank you|Nice to meet you|Sige|Opo|Got it|Welcome|Salamat po|Thanks po";
       const patterns = [
+        // 1) LANI echoes the name right after a trigger: "Nice to meet you, Veronica"
         new RegExp(
           `(?:${TRIGGERS})[,! ]+(?:po[,! ]+)?([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)+)`,
           "g"
         ),
-        /(?:tu nombre|full name|name)\b.{0,20}?([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)/g,
-        // Bare-line name (user typed just their name on its own line).
-        // Guarded by NAME_STOPWORDS below to avoid Taglish false positives.
-        /^([a-záéíóúñA-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ]+(?:\s[a-záéíóúñA-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ]+)+)$/gm
+        // 2) LANI echoes the name mid-sentence followed by a comma/!/?/dash:
+        //    "...para sa booking, Veronica Manalo —" or "Got it, Veronica Manalo!"
+        //    Anchored so it cannot swallow a following word (e.g. "... July").
+        /([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)(?=[,!?.…]|\s—|\s-\s|'s\b|$)/gm,
+        // 3) Explicit "name" cue in either direction.
+        /(?:tu nombre|full name|\bname\b|pangalan)\b.{0,25}?([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)/gi,
+        // 4) Bare-line name (user typed just their name on its own line).
+        /^([a-záéíóúñA-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ]+(?:\s[a-záéíóúñA-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ]+)+)$/gm,
+        // 5) BROAD fallback: any 2-3 word capitalized proper noun sequence,
+        //    scanned newest-first, stopword-guarded. Catches names given inside
+        //    a sentence like "Okay paki add. Veronica Manalo".
+        //    Anchored to end-of-token boundaries so it won't merge across words
+        //    that start a new capitalized token on the same line by accident.
+        /([A-ZÁÉÍÓÚÑ][a-záéíóúñ]{1,}\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{1,}(?:\s[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{1,})?)(?=[\s,!?.…]|$)/gm
       ];
 
-      for (const pattern of patterns) {
-        const matches = [...allText.matchAll(pattern)];
-        // Walk matches newest-first; return the first that passes the guard.
-        for (let i = matches.length - 1; i >= 0; i--) {
-          const candidate = matches[i][1];
-          if (!candidate) continue;
-          // Reject anything containing common filler words (Taglish/ES/EN).
-          if (containsStopword(candidate)) continue;
-          // Reject absurdly long "names" (likely a sentence that slipped through).
-          if (candidate.split(/\s+/).length > 4) continue;
-          return candidate
-            .split(" ")
-            .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-            .join(" ");
+      // Patterns 1-4 look at all text (assistant confirmations are reliable).
+      // Pattern 5 (broad) should look at USER text FIRST (their own name),
+      // then fall back to assistant text.
+      const searchTexts = [allText, userText, assistantText];
+
+      for (let p = 0; p < patterns.length; p++) {
+        const pattern = patterns[p];
+        // For the broad pattern (index 4), prefer scanning user text first.
+        const texts = p === 4 ? [userText, assistantText] : [allText];
+        for (const text of texts) {
+          const matches = [...text.matchAll(pattern)];
+          for (let i = matches.length - 1; i >= 0; i--) {
+            const candidate = matches[i][1];
+            if (!candidate) continue;
+            if (containsStopword(candidate)) continue;
+            const words = candidate.split(/\s+/);
+            if (words.length > 4 || words.length < 2) continue;
+            // Guard: each token must look like a name (letters only, 2+ chars).
+            if (!words.every(w => /^[A-Za-zÁÉÍÓÚÑáéíóúñ]{2,}$/.test(w))) continue;
+            return words
+              .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+              .join(" ");
+          }
         }
       }
       break;
@@ -1096,24 +1232,39 @@ CRITICAL EXTRACTION RULES:
      Daniel Arevalo" — that means guest_name = "Daniel Arevalo"
    - Look at email addresses, phone numbers in user messages — KEEP them
 
-3. ⚠️ CRITICAL RULE — HANDLE CORRECTIONS:
+3. ⚠️⚠️ CRITICAL RULE — HANDLE CORRECTIONS (HIGHEST PRIORITY):
    A correction ADDS or MODIFIES ONE field. It NEVER resets others.
+   THIS IS THE #1 CAUSE OF BUGS. A date change is NOT a reason to forget
+   the name or email. Re-read the ENTIRE history and carry EVERY field forward.
    
    - "espera, mejor cambia a 4 personas" → 
      UPDATE guests_count to 4. 
      KEEP guest_name, guest_email, room_type, check_in, check_out, etc.
    
-   - "cambia la fecha al 21 al 24" → 
-     UPDATE check_in and check_out. 
-     KEEP everything else (name, email, phone, room, guests).
+   - "cambia la fecha al 21 al 24" / "July 16-18" / "change it to July 25-28" → 
+     UPDATE check_in and check_out ONLY. 
+     KEEP everything else (name, email, phone, room, guests, add_ons).
+     ⚠️ If the guest already told you their name or email EARLIER in the
+        conversation, you MUST still return them now. Scan the whole history.
    
    - "mejor ocean view" →
      UPDATE room_type to ocean_view.
      KEEP everything else.
    
+   ⚠️ REAL FAILURE EXAMPLES TO AVOID (these happened in production):
+   - Guest said "Veronica Manalo" earlier, then changed the date twice.
+     WRONG: returning guest_name:null after the date change → LANI re-asked
+     the name 4 times. RIGHT: keep guest_name:"Veronica Manalo" through every
+     date change.
+   - Guest gave email "ericamhelb@gmail.com", then dates changed.
+     WRONG: dropping the email → LANI asked for it 3 times.
+     RIGHT: carry the email forward.
+   
    ⚠️ BEFORE RESPONDING, ASK YOURSELF:
-   "Did I accidentally set to null any field that appears in the 
-    conversation history above? If YES → restore it from history."
+   "For EACH field (name, email, check_in, check_out, guests, room, add_ons):
+    does it appear ANYWHERE in the conversation history above? If YES, it MUST
+    be present in my output — even if this turn was only about a date change.
+    Did I accidentally set any of them to null? If YES → restore from history."
    
    The ONLY way to remove a field is if the guest EXPLICITLY says 
    "olvida el nombre" / "ignore the name" / similar reset.
@@ -1158,6 +1309,16 @@ ${upsellsText}
    - For per_hour items, ask the guest for hours if not specified, otherwise null.
    - If guest cancels an add-on ("ya no quiero el transfer"), remove it from the array.
    - ACCUMULATE add_ons across turns just like other fields.
+   - ⚠️ CRITICAL — PRESERVE add_ons ON CORRECTIONS:
+     The add_ons array must reflect EVERY extra the guest has confirmed across the
+     WHOLE conversation — read the full history above to find them. If the guest
+     earlier confirmed an extra (e.g. "add the airport transfer") and now sends a
+     message about something ELSE (changing the date, the number of guests, giving
+     their email, etc.), you MUST still include that previously-confirmed extra in
+     the add_ons array. A date change or guest-count change NEVER removes extras.
+     Example: guest added airport transfer on turn 3, then on turn 6 says "change
+     the date to July 1-2" → add_ons MUST still contain the airport transfer.
+     The ONLY time an extra leaves the array is if the guest EXPLICITLY cancels it.
 
 7. DATE PARSING:
    - "del 15 al 18 de junio" with today being ${todayISO} → 
@@ -1254,10 +1415,45 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
     // Guarantee the webhook phone is present no matter what.
     if (webhookPhone) mergedData.guest_phone = webhookPhone;
 
-    if (Array.isArray(extracted.data?.add_ons)) {
-      mergedData.add_ons = extracted.data.add_ons;
-    } else if (!mergedData.add_ons) {
-      mergedData.add_ons = [];
+    // ── Fix (v20): Protect existing add_ons from being wiped on corrections ──
+    // The extractor returns add_ons as ABSOLUTE state each turn. When the guest's
+    // message is about something else (e.g. "change the date to July 1-2"), the
+    // extractor often returns add_ons: [] because the message didn't mention the
+    // extras — and the old code below would overwrite the saved extras with that
+    // empty array, silently dropping a paid transfer/tour. (Veronica's test:
+    // added airport transfer, changed the date, transfer vanished from the total.)
+    // Rule now: an empty/absent add_ons NEVER erases existing ones. We only clear
+    // or shrink add_ons when the guest EXPLICITLY cancels one in THIS message.
+    //
+    // Source of existing add_ons: activeBooking (from Make) does NOT carry add_ons
+    // during the collection phase, so the authoritative prior state lives in the
+    // conversation history. We recover confirmed add-ons from there as a backstop.
+    const existingAddOns = (Array.isArray(mergedData.add_ons) && mergedData.add_ons.length > 0)
+      ? mergedData.add_ons
+      : recoverAddOnsFromHistory(previousMessages, upsellsCatalog);
+    const incomingAddOns = Array.isArray(extracted.data?.add_ons) ? extracted.data.add_ons : null;
+
+    // Detect an explicit cancellation in the current user message (EN/ES/TL).
+    const cancelAddOnRx = /\b(ya no quiero|quita(?:r|me)?|cancela(?:r|me)?|remove|cancel|take off|drop the|alisin|tanggalin|wag na|ayaw ko na)\b/i;
+    const guestCancelled = userMessage && cancelAddOnRx.test(String(userMessage));
+
+    if (incomingAddOns && incomingAddOns.length > 0) {
+      // The extractor returned concrete add-ons this turn. Merge with existing so
+      // a re-stated single extra doesn't drop others. De-dup by normalized name.
+      const merged = [...existingAddOns];
+      for (const inc of incomingAddOns) {
+        const incName = (inc.name || "").toLowerCase().replace(/\s+/g, " ").trim();
+        const already = merged.find(e => (e.name || "").toLowerCase().replace(/\s+/g, " ").trim() === incName);
+        if (!already) merged.push(inc);
+      }
+      mergedData.add_ons = merged;
+    } else if (guestCancelled) {
+      // Guest explicitly cancelled — honor the extractor's (reduced/empty) set.
+      mergedData.add_ons = incomingAddOns || [];
+    } else {
+      // Empty/absent add_ons with NO explicit cancellation → keep what we had.
+      // This is the correction case (date/guests change) that used to wipe extras.
+      mergedData.add_ons = existingAddOns;
     }
 
     // ── Bug fix (Larra test): aggressive email capture ───────────
@@ -1274,12 +1470,17 @@ RESPOND ONLY WITH A JSON OBJECT in this exact shape, no other text:
       }
     }
 
+    // ── v21: Deterministic field recovery on every turn ──────────────
+    // If the extractor returned empty for a field that was already provided
+    // earlier (common on date-change/correction turns), recover it from
+    // history so LANI never re-asks for something the guest already gave.
     const recoverableFields = ["guest_name", "guest_email", "guest_phone"];
     for (const field of recoverableFields) {
       if (!mergedData[field]) {
         const recovered = recoverFieldFromHistory(field, previousMessages);
         if (recovered) {
           mergedData[field] = recovered;
+          console.log(`[LANI] v21 recovered ${field} from history:`, recovered);
         }
       }
     }
@@ -2467,7 +2668,21 @@ This is WhatsApp, not email. Write like a helpful, warm person, not a form or a 
 Avoid bullet-point lists with 6+ items. Avoid walls of text.
 When showing a booking summary, a clear 3-4 line breakdown is ideal.
 If you find yourself writing more than 6-7 lines, consider what is essential and trim the rest.
-This is a guideline, not a hard cap. A complete booking confirmation with costs needs enough space to be clear.`;
+This is a guideline, not a hard cap. A complete booking confirmation with costs needs enough space to be clear.
+
+CRITICAL RULE — DO NOT PROMISE AVAILABILITY BEFORE IT IS CHECKED:
+Real availability is verified LATER in the flow (at the payment/hold step), NOT when
+the guest first gives their dates. So when a guest gives dates, DO NOT say things that
+promise the dates are free, such as "that works!", "those dates are available!",
+"mayroon kaming available para sa dates na iyon", or "perfect, that date is open".
+Those exact dates may turn out to be taken once the system checks the calendar, and
+promising availability first makes you contradict yourself later.
+INSTEAD, acknowledge the dates and move forward WITHOUT asserting they are free, e.g.:
+- "Got it, July 10-15 — let me take down the details and I'll confirm availability for you."
+- "Noted po, July 10-15! Let's get your booking set up." (no availability claim)
+If a guest asks point-blank "is it available?", say you'll confirm availability as part of
+completing the booking — do not guess yes or no. The system will tell them clearly if the
+dates are not available when it checks.`;
 
     let bookingContext = "";
     let templatedReply = null; // Paso 2: si se setea, saltamos la 2ª llamada a Claude
@@ -2648,6 +2863,13 @@ Suggested phrasing: "${bookingFlow.suggested_reply}"
 You may adapt the phrasing to sound natural, but ask ONLY for this one field.
 Do NOT mention any confirmed field as if it were missing.
 Do NOT confirm the booking yet. Do NOT mention payment yet.${partialBreakdown}
+
+🚫🚫 NEVER ASK FOR THE PHONE NUMBER — NOT NOW, NOT EVER:
+You ALREADY have the guest's phone number (it comes automatically from WhatsApp).
+Even right after you get the guest's name, do NOT ask "what's your phone number?"
+The natural form-filling instinct of "name → phone" is WRONG here. After the name,
+the next thing you need is the EMAIL, never the phone. If ${bookingFlow.next_question}
+is not the phone (it never will be), do not bring up the phone at all.
 
 IF THE GUEST CLAIMS THEY ALREADY PROVIDED THIS FIELD (e.g. "I already gave it", "ya te lo di", "naibigay ko na", "te lo dije"):
 - First, double-check the conversation above. If it IS there, use it — do NOT ask again.
